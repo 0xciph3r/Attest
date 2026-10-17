@@ -1,0 +1,46 @@
+version: "2"
+
+run:
+  build-tags:
+    - e2e
+
+linters:
+  enable:
+    - bodyclose
+    - errorlint
+    - gosec
+    - misspell
+    - nilerr
+    - revive
+    - unconvert
+    - unparam
+  settings:
+    gosec:
+      excludes:
+        # File paths come from operator-supplied CLI flags by design.
+        - G304
+    revive:
+      rules:
+        - name: exported
+        - name: package-comments
+  exclusions:
+    presets:
+      - std-error-handling
+    rules:
+      - path: _test\.go
+        linters:
+          - gosec
+          - unparam
+      # Tests intentionally drive the CLI binary with variable arguments.
+      - path: e2e/
+        linters:
+          - gosec
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/0xciph3r/attest
