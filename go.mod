@@ -1,6 +1,6 @@
 module github.com/0xciph3r/attest
 
-go 1.26.3
+go 1.26.6
 
 require modernc.org/sqlite v1.60.1
 

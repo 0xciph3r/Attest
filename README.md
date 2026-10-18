@@ -33,7 +33,8 @@ for the status of each.
 
 ## Quick start
 
-Requires Go 1.26.
+Requires Go 1.26.6 or later (earlier 1.26 releases have a reachable
+`encoding/asn1` vulnerability, GO-2026-5972).
 
 ```bash
 make build    # bin/attestctl (static, CGO-free)
