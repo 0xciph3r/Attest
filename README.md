@@ -12,7 +12,7 @@ govern workload identity and access to secrets:
 3. **Identity** — a short-lived workload identity is issued only after verification.
 4. **Secret release** — each request is authorized against current policy and audited.
 
-> **Status: early development (weeks 01–02 of a 12-week MVP).** Attest is not
+> **Status: early development (weeks 03–05 of a 12-week MVP).** Attest is not
 > production-ready and makes no compliance claims. Read the
 > [threat model](docs/threat-model.md) for what it does and does not protect.
 
@@ -27,9 +27,20 @@ The tamper-evident audit ledger and its offline tooling:
 - `attestctl audit verify` detects alteration, reordering, truncation and
   backup rollback relative to trusted checkpoints.
 
-Enrollment, TPM verification, workload identity and the secret broker are
-designed or planned; see [security properties](docs/security-properties.md)
-for the status of each.
+TPM enrollment and attestation, in process (the network API arrives with
+workload identity):
+
+- Operator-approved node registration by EK certificate; AK residency proven
+  by TPM credential activation ([enrollment](docs/enrollment.md)).
+- Single-use, expiring attestation challenges; quote, PCR and strict
+  measured-boot event-log verification against a versioned measurement
+  policy. Every verdict, pass or fail, is recorded with a reason code and an
+  audit entry in one transaction.
+- Tested end to end against a software TPM (`swtpm`); no hardware TPM has been
+  validated yet ([platform limitations](docs/platform-limitations.md)).
+
+Workload identity and the secret broker are planned; see
+[security properties](docs/security-properties.md) for the status of each.
 
 ## Quick start
 
@@ -40,6 +51,9 @@ Requires Go 1.26.6 or later (earlier 1.26 releases have a reachable
 make build    # bin/attestctl (static, CGO-free)
 make check    # gofmt, vet, lint, race tests, e2e tests
 make e2e      # reproduce the audit attack scenarios against real database files
+
+make swtpm-up test-tpm   # TPM integration tests (needs Docker)
+make swtpm-down
 ```
 
 Usage against an Attest database (the `attestd` server that writes it arrives
@@ -57,14 +71,20 @@ procedure.
 ## Repository layout
 
 ```
-cmd/attestctl/      operator CLI
-internal/audit/     hash chain, checkpoints, verification
-internal/store/     SQLite persistence and migrations
-e2e/                end-to-end tests against built binaries
-docs/               threat model, security properties, designs
+cmd/attestctl/        operator CLI
+internal/audit/       hash chain, checkpoints, verification
+internal/store/       SQLite persistence, migrations and schema invariants
+internal/enrollment/  node registration and AK credential activation
+internal/verifier/    EK, AK, quote and evidence checks; attestation service
+internal/eventlog/    strict TCG event-log parser and replay
+internal/policy/      measurement policy
+internal/tpm/         agent-side TPM operations; swtpm transport for tests
+deploy/swtpm/         development software TPM image
+e2e/                  end-to-end tests against built binaries
+docs/                 threat model, security properties, designs
 ```
 
-Planned: `cmd/attestd`, `cmd/attest-agent`, `api/proto`, `internal/{enrollment,verifier,identity,policy,broker}`, `libattest`, `deploy/`.
+Planned: `cmd/attestd`, `cmd/attest-agent`, `api/proto`, `internal/{identity,broker}`, `libattest`.
 
 ## Documentation
 
