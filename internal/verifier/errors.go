@@ -35,6 +35,10 @@ const (
 	ReasonChallengeWrongNode Reason = "challenge_wrong_node"
 	ReasonNodeNotEnrolled    Reason = "node_not_enrolled"
 	ReasonActivationFailed   Reason = "activation_failed"
+	ReasonNodeUnknown        Reason = "node_unknown"
+	ReasonNodeState          Reason = "node_state_invalid"
+	ReasonAKInUse            Reason = "ak_in_use"
+	ReasonPolicyMissing      Reason = "policy_missing"
 )
 
 // Error is a verification failure.
@@ -51,6 +55,9 @@ func (e *Error) Error() string {
 }
 
 func (e *Error) Unwrap() error { return e.Err }
+
+// Reject returns a verification failure with reason r.
+func Reject(r Reason, format string, args ...any) *Error { return fail(r, format, args...) }
 
 func fail(r Reason, format string, args ...any) *Error {
 	return &Error{Reason: r, Err: fmt.Errorf(format, args...)}
