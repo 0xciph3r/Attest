@@ -58,7 +58,8 @@ var (
 // IssueEKCert issues a TCG-style EK certificate for pub: empty subject and
 // a critical subjectAltName that holds only a directoryName, exactly the
 // shape that Go's x509 verifier treats as an unhandled critical extension.
-func (ca *CA) IssueEKCert(t testing.TB, pub crypto.PublicKey) []byte {
+// Modifiers may adjust the template before signing.
+func (ca *CA) IssueEKCert(t testing.TB, pub crypto.PublicKey, mods ...func(*x509.Certificate)) []byte {
 	t.Helper()
 	name, err := asn1.Marshal(pkix.Name{ExtraNames: []pkix.AttributeTypeAndValue{
 		{Type: oidTPMManufacturer, Value: "id:41545354"},
@@ -82,6 +83,9 @@ func (ca *CA) IssueEKCert(t testing.TB, pub crypto.PublicKey) []byte {
 		UnknownExtKeyUsage:    []asn1.ObjectIdentifier{oidTCGKpEKCert},
 		BasicConstraintsValid: true,
 		ExtraExtensions:       []pkix.Extension{{Id: oidSAN, Critical: true, Value: san}},
+	}
+	for _, m := range mods {
+		m(tmpl)
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, ca.Cert, pub, ca.key)
 	if err != nil {
