@@ -1,6 +1,6 @@
 module github.com/0xciph3r/attest
 
-go 1.26.6
+go 1.26.10
 
 require (
 	github.com/google/go-tpm v0.9.8
