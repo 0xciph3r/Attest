@@ -16,13 +16,18 @@ import (
 // stored entry. Callers performing a security-sensitive operation must treat
 // an error here as a failure of that operation (fail closed).
 func (s *Store) AppendAudit(ctx context.Context, rec audit.Record) (audit.Entry, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return audit.Entry{}, fmt.Errorf("store: begin audit append: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
+	var e audit.Entry
+	err := s.Update(ctx, func(tx *Tx) error {
+		var err error
+		e, err = tx.AppendAudit(rec)
+		return err
+	})
+	return e, err
+}
 
-	head, err := auditHead(ctx, tx)
+// AppendAudit extends the audit chain within the transaction.
+func (t *Tx) AppendAudit(rec audit.Record) (audit.Entry, error) {
+	head, err := auditHead(t.ctx, t.tx)
 	if err != nil {
 		return audit.Entry{}, err
 	}
@@ -37,14 +42,11 @@ func (s *Store) AppendAudit(ctx context.Context, rec audit.Record) (audit.Entry,
 	if len(e.Metadata) > 0 {
 		metadata = e.Metadata
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO audit_entries
+	if _, err := t.tx.ExecContext(t.ctx, `INSERT INTO audit_entries
 		(seq, recorded_at, actor, action, object, metadata, prev_hash, hash)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		int64(e.Sequence), e.Time.UnixNano(), e.Actor, e.Action, e.Object, metadata, e.PrevHash[:], e.Hash[:]); err != nil {
 		return audit.Entry{}, fmt.Errorf("store: insert audit entry: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return audit.Entry{}, fmt.Errorf("store: commit audit entry: %w", err)
 	}
 	return e, nil
 }
