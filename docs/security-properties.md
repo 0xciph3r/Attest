@@ -12,9 +12,9 @@ Status key: **implemented** · **designed** · **planned**.
 
 | ID  | Property            | Status       |
 | --- | ------------------- | ------------ |
-| P1  | Enrollment          | designed     |
-| P2  | Freshness           | planned      |
-| P3  | Evidence            | planned      |
+| P1  | Enrollment          | implemented  |
+| P2  | Freshness           | implemented  |
+| P3  | Evidence            | implemented  |
 | P4  | Identity            | planned      |
 | P5  | Authorization       | planned      |
 | P6  | Workload isolation  | planned      |
@@ -23,46 +23,94 @@ Status key: **implemented** · **designed** · **planned**.
 | P9  | Failure behavior    | partial      |
 | P10 | Recovery            | partial      |
 
-## P1 Enrollment
+## P1 Enrollment — implemented
 
 **Claim.** A machine becomes an enrolled node only if an authenticated
 operator registered its TPM's endorsement key beforehand, and the attestation
 key presented at enrollment is proven to reside in that same TPM.
 
-- Mechanism: operator pre-registration of the EK; EK certificate validation;
-  credential activation binding the AK to the EK. See
+- Mechanism: operator registration of the EK certificate; EK chain validation
+  against configured roots; the EK public area is derived from the
+  certificate, never taken from the node; credential activation binding the
+  AK name (computed by the control plane) to that EK. See
   [enrollment.md](enrollment.md).
-- Assumptions: 1, 5.
-- Failure behavior: no pending registration, invalid EK chain, AK with
-  incorrect attributes or failed activation → enrollment rejected and audited;
-  no node record transitions to `enrolled`.
-- Tests: planned (weeks 03–05).
+- Assumptions: 1, 5. Operator authentication arrives with the API (weeks
+  06–08); until then registration is an in-process call.
+- Failure behavior: unregistered node, node not in `registered` state, EK
+  chain no longer valid, development root not allowed by policy, AK with
+  incorrect attributes, failed activation, expired/consumed/other-node
+  challenge, or AK already enrolled elsewhere → enrollment rejected, challenge
+  consumed, denial audited with a reason code; the node does not become
+  `enrolled`.
 
-## P2 Freshness
+Tests:
+
+| Case | Test |
+| ---- | ---- |
+| Full flow with a real TPM, RSA and ECC EKs | `internal/verifier` `TestChainOfTrust` (swtpm) |
+| Derived EK equals the TPM's EK | `TestDerivedEKMatchesTPM` (swtpm) |
+| Software AK not in the TPM cannot activate | `TestEnrollmentRequiresResidentAK` (swtpm) |
+| Real AK in a TPM other than the registered one | `TestEnrollmentRequiresApprovedTPM` (swtpm) |
+| Untrusted CA, oversized cert, duplicate EK, invalid node ID | `internal/enrollment` `TestRegisterRejects` |
+| Development root refused without policy, refused after policy withdrawal | `TestEnrollDevelopmentRoot` |
+| Unknown node, non-restricted or malformed AK, already enrolled node | `TestBeginRejects` |
+| Wrong/short secret, expired, wrong node, unknown challenge, revoked, EK cert expired, AK in use; each attempt consumes the challenge | `TestCompleteRejects` |
+| Credential secret never persisted in plaintext | `TestSecretNotStored` |
+| Schema refuses deletion, identity changes and invalid transitions | `internal/store` `TestSchemaGuardsNodes`, `TestNodeLifecycle` |
+
+## P2 Freshness — implemented
 
 **Claim.** Each accepted quote was produced after the control plane issued the
 challenge it answers, and each challenge is accepted at most once.
 
-- Mechanism: ≥128-bit random nonce from `crypto/rand`, stored only as a hash,
-  bound to one node, expiring, and consumed in the same transaction that
-  records the verification result. The nonce is the quote's qualifying data
-  (`extraData`).
-- Failure behavior: unknown, expired, consumed or other-node challenge →
-  reject.
-- Tests: planned — replay of a consumed challenge, cross-node challenge,
-  expired challenge, concurrent double submission.
+- Mechanism: 256-bit random nonce from `crypto/rand`, stored only as a hash,
+  bound to one enrolled node, expiring after one minute, and consumed in the
+  same transaction that records the verdict and its audit entry. The nonce is
+  the quote's qualifying data (`extraData`) and is compared in constant time.
+- Failure behavior: unknown or consumed challenge → reject and audit (no
+  verdict row, since the challenge has or had one). Expired, other-node or
+  nonce-mismatched answer → challenge consumed, failed verdict recorded and
+  audited. A database trigger refuses re-consumption even by direct SQL.
 
-## P3 Evidence
+Tests (`internal/verifier`): `TestServiceAttest` (replay after success),
+`TestServiceRejects` (expired, answered by another node, wrong nonce echoed,
+quote over another nonce; every failure consumes the challenge),
+`TestServiceConcurrentReplay` (eight concurrent submissions, one accepted),
+`TestServiceUnknownChallengeAuditedOnly`, `TestChainOfTrust/replayed_quote`
+(swtpm); `internal/store` `TestChallengesAreSingleUse`.
+
+## P3 Evidence — implemented
 
 **Claim.** Attestation succeeds only if the quote signature verifies under the
 node's enrolled AK, the quoted PCR digest matches the supplied PCR values, the
 measured-boot event log replays to those PCR values, and the measurements
 satisfy the active policy version.
 
-- Failure behavior: every check failure has a distinct, tested reason code.
-  Malformed input is rejected before cryptographic processing.
-- Tests: planned — invalid signature, wrong AK, PCR mismatch, event-log/PCR
-  mismatch, disallowed measurement, truncated and oversized evidence.
+- Mechanism: size limits and canonical decoding before use; ECDSA P-256
+  signature over `TPMS_ATTEST` under the enrolled AK; magic and type checks;
+  nonce; exact PCR selection required by the policy; PCR digest; strict
+  crypto-agile SHA-256 event-log replay in which **every** selected PCR must
+  replay, including PCRs with no events; then first matching policy
+  reference. The policy is the version current at verification time, and its
+  version is recorded with the verdict.
+- Failure behavior: each check has a distinct reason code
+  (`malformed_evidence`, `bad_signature`, `not_a_quote`, `nonce_mismatch`,
+  `pcr_selection_mismatch`, `pcr_digest_mismatch`, `event_log_invalid`,
+  `event_log_replay_mismatch`, `measurement_not_allowed`,
+  `ek_development_root`, `node_not_enrolled`, `policy_missing`). A stored
+  policy that fails to parse or whose digest has changed aborts verification
+  without recording a verdict.
+- Known limitation: the event-log parser applies no firmware workarounds. Real
+  firmware with non-conforming logs will fail closed until a specific,
+  documented workaround is added.
+
+Tests: `internal/verifier` `TestVerifyEvidence*` and the quote negative cases
+(about twenty, each asserting its reason), `TestServiceRejects` (signature by
+an unenrolled key, PCR claim differs from quote, log does not replay, log
+missing, measurement not in policy, policy changed after the challenge, node
+revoked after the challenge), `TestServiceDevelopmentRoot`;
+`TestChainOfTrust` (swtpm: PCR extended outside the log, boot not in policy,
+revoked node); `internal/eventlog` and `internal/policy` unit tests.
 
 ## P4 Identity
 
