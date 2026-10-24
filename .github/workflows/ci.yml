@@ -27,6 +27,22 @@ jobs:
       - name: Static Linux builds
         run: make linux
 
+  tpm:
+    # Attestation against a real TPM 2.0 implementation (swtpm in Docker).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Start swtpm
+        run: make swtpm-up
+      - name: TPM integration tests
+        run: make test-tpm
+      - name: swtpm logs
+        if: failure()
+        run: docker logs attest-swtpm || true
+
   lint:
     runs-on: ubuntu-latest
     steps:
