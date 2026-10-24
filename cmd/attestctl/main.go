@@ -9,6 +9,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/0xciph3r/attest/internal/audit"
+	"github.com/0xciph3r/attest/internal/policy"
 )
 
 // Exit codes. Verification failures are distinguished from operational errors
@@ -45,7 +46,7 @@ func newRootCmd() *cobra.Command {
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
-	root.AddCommand(newAuditCmd())
+	root.AddCommand(newAuditCmd(), newPolicyCmd())
 	return root
 }
 
@@ -54,5 +55,6 @@ func isVerificationFailure(err error) bool {
 	return errors.As(err, &ve) ||
 		errors.Is(err, audit.ErrCheckpointSignature) ||
 		errors.Is(err, audit.ErrUnknownKey) ||
-		errors.Is(err, audit.ErrUnanchored)
+		errors.Is(err, audit.ErrUnanchored) ||
+		errors.Is(err, policy.ErrInvalid)
 }
