@@ -112,9 +112,9 @@ built), **planned** (scheduled week in the MVP plan).
 
 | Threat                                              | Adversary | Mitigation                                                                                  | Status        |
 | --------------------------------------------------- | --------- | ------------------------------------------------------------------------------------------- | ------------- |
-| Unapproved machine enrolls itself                   | A2        | Operator pre-registers EK; enrollment rejected without a pending registration               | designed (W03) |
-| AK not resident in the claimed TPM                  | A2        | Credential activation binds AK name to EK (`MakeCredential`/`ActivateCredential`)            | designed (W03) |
-| Software TPM accepted as hardware                   | A2        | EK chain must verify against configured roots; `swtpm` roots are dev-only and flagged in results | designed (W03) |
+| Unapproved machine enrolls itself                   | A2        | Operator pre-registers EK; enrollment rejected without an operator registration               | implemented |
+| AK not resident in the claimed TPM                  | A2        | Credential activation binds AK name to EK (`MakeCredential`/`ActivateCredential`)            | implemented |
+| Software TPM accepted as hardware                   | A2        | EK chain must verify against configured roots; development roots (e.g. `swtpm`) refused unless the policy allows them, and flagged in results | implemented |
 | Workload claims another workload's identity         | A4        | Agent identifies callers via kernel peer credentials mapped to configured systemd units      | planned (W06–08) |
 | Forged operator request                             | A5        | Authenticated admin API; per-operation authorization                                       | planned        |
 | Forged audit checkpoint                             | A7        | Ed25519 signature by a key not held on the control plane                                    | implemented   |
@@ -123,12 +123,12 @@ built), **planned** (scheduled week in the MVP plan).
 
 | Threat                                              | Adversary | Mitigation                                                                  | Status       |
 | --------------------------------------------------- | --------- | --------------------------------------------------------------------------- | ------------ |
-| Modified boot chain reported as good                | A3        | Quote signature over PCRs; event-log replay must reproduce quoted PCRs; policy on measurements | planned (W03–05) |
-| Evidence modified in transit                        | A1        | Quote is signed by AK; TLS on TB2                                           | planned      |
+| Modified boot chain reported as good                | A3        | Quote signature over PCRs; event-log replay must reproduce quoted PCRs; policy on measurements | implemented |
+| Evidence modified in transit                        | A1        | Quote is signed by AK; TLS on TB2                                           | signature implemented; TLS planned (W06–08) |
 | Audit entry altered, reordered or removed           | A7        | Hash chain plus externally held signed checkpoints                          | implemented  |
 | Accidental audit UPDATE/DELETE by application bug   | —         | SQLite triggers reject UPDATE, DELETE and non-head inserts                  | implemented  |
 | Database rolled back to an older backup             | A7        | Checkpoint ahead of the restored head reports truncation                    | implemented  |
-| Policy altered without record                       | A5, A7    | Versioned policy; every apply audited                                       | planned      |
+| Policy altered without record                       | A5, A7    | Append-only, contiguous policy versions; every apply audited; verdicts record the policy version | implemented (measurement policy) |
 
 ### Repudiation
 
@@ -159,7 +159,7 @@ control plane unavailable can deny service; this is accepted.
 | Successful attestation treated as access to all secrets   | A3, A4    | Attestation only gates identity; secrets require explicit grants | planned    |
 | Workload inherits node-wide identity                      | A4        | Identities are per workload; no node-wide secret access       | planned    |
 | Ordinary operator reads secret values                     | A5        | Separate secret-read and break-glass permissions, each audited | planned    |
-| Replay of an old valid quote                              | A1        | Challenge is random (≥128 bits), single-use, expiring, bound into the quote's qualifying data | planned (W03–05) |
+| Replay of an old valid quote                              | A1        | Challenge is random (≥128 bits), single-use, expiring, bound into the quote's qualifying data | implemented |
 
 ## 7. Explicitly out of scope for v1
 
