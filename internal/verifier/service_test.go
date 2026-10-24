@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -304,4 +305,37 @@ func TestApplyPolicy(t *testing.T) {
 	if h, _ := e.st.AuditHead(bg); h.Sequence != 2 {
 		t.Fatalf("policy changes not audited: head %d", h.Sequence)
 	}
+}
+
+// Concurrent submissions of the same answer yield exactly one verdict.
+func TestServiceConcurrentReplay(t *testing.T) {
+	e := newSvcEnv(t)
+	ak := e.node("node-1", false)
+	c := e.challenge("node-1")
+	ev := evidence(t, ak, c, e.boot)
+
+	const n = 8
+	errs := make(chan error, n)
+	var wg sync.WaitGroup
+	for range n {
+		wg.Go(func() {
+			_, err := e.svc.Verify(bg, "node-1", c.ID, c.Nonce, ev)
+			errs <- err
+		})
+	}
+	wg.Wait()
+	close(errs)
+	ok := 0
+	for err := range errs {
+		switch {
+		case err == nil:
+			ok++
+		case ReasonOf(err) != ReasonChallengeConsumed:
+			t.Errorf("unexpected error: %v", err)
+		}
+	}
+	if ok != 1 {
+		t.Fatalf("%d submissions accepted", ok)
+	}
+	e.verifyAudit()
 }
