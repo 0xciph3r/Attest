@@ -1,8 +1,9 @@
 # Node enrollment and key lifecycle
 
-Status: **design**. Implementation is scheduled for weeks 03–05. This document
-defines the protocol and state machine that implementation and tests must
-follow. Property: [P1 Enrollment](security-properties.md#p1-enrollment).
+Status: **implemented** in process (`internal/enrollment`), tested against
+`swtpm`. The network transport between agent and control plane arrives with
+the gRPC API in weeks 06–08. This document defines the protocol and state
+machine that the implementation and tests follow. Property: [P1 Enrollment](security-properties.md#p1-enrollment).
 
 ## Goals
 
@@ -35,67 +36,91 @@ follow. Property: [P1 Enrollment](security-properties.md#p1-enrollment).
 
 ```
 Operator          attestctl/attestd                  attest-agent / TPM
-   │  register EK ───────▶│ node: pending (audited)
+   │  register EK cert ──▶│ 1. cert chains to a configured root
+   │                      │    node: registered (audited)
    │                      │
-   │                      │◀── EK pub (+cert), AK public area ───┤ (TLS, server pinned)
-   │                      │  1. EK matches a pending registration
-   │                      │  2. EK cert chains to a configured root
-   │                      │  3. AK attributes are exactly as required
-   │                      │  4. secret ← random 32 bytes
+   │                      │◀── AK public area ───────────────────┤
+   │                      │  2. node is registered (not enrolled/revoked)
+   │                      │  3. AK attributes are exactly as required;
+   │                      │     AK name computed by the control plane
+   │                      │  4. EK cert re-verified; EK public derived from it
+   │                      │  5. secret ← random 32 bytes
    │                      │     blob ← MakeCredential(EK, name(AK), secret)
-   │                      │──── blob, enrollment id ─────────────▶│
+   │                      │──── blob, challenge id ──────────────▶│
    │                      │                                       │ ActivateCredential
    │                      │                                       │ (succeeds only if AK
    │                      │                                       │  with that name is in
    │                      │                                       │  the TPM holding EK)
    │                      │◀──── recovered secret ────────────────┤
-   │                      │  5. constant-time compare, single use, not expired
-   │                      │  6. node: enrolled, AK pub stored (audited)
+   │                      │  6. single use, not expired, same node,
+   │                      │     constant-time hash compare
+   │                      │  7. node: enrolled, AK stored (audited)
 ```
 
-1. **Registration.** An operator runs `attestctl node register` with the EK
-   public key or EK certificate obtained from the machine out of band (e.g.
-   during provisioning). The node enters `pending` with an expiry. This is the
-   approval step; no node can create its own registration.
-2. **Request.** The agent sends its EK public key, EK certificate if
-   available, and the AK public area. The control plane computes the AK name
-   itself from the public area; it never trusts a client-supplied name.
-3. **Validation.** Reject unless the EK matches a pending, unexpired
-   registration; the EK certificate (when required by configuration) chains to
-   a configured manufacturer root; and the AK attributes match the table above
-   exactly.
-4. **Credential challenge.** The control plane generates a random secret and
-   uses `MakeCredential` to encrypt it to the EK, bound to the AK name. It
-   stores only a hash of the secret, with a short expiry.
-5. **Activation.** The agent calls `ActivateCredential`. The TPM releases the
+1. **Registration.** An operator registers the machine's EK certificate,
+   obtained out of band (e.g. read during provisioning). The certificate must
+   chain to a configured root; an EK that chains only to a development root is
+   refused unless the current measurement policy sets
+   `allow_development_roots`. The EK public area is *derived* from the
+   certificate and the TCG default template; nothing the node later claims
+   about its EK is used. This is the approval step; no node can create its own
+   registration. One EK maps to at most one live (non-revoked) node.
+2. **Begin.** The agent sends only its AK public area. The control plane
+   requires the node to be `registered`, parses the AK and requires its
+   attributes to equal the AK template exactly (below), computes the AK name
+   itself, and re-verifies the registered EK certificate (roots or validity
+   may have changed). It stores only `SHA-256(secret)`, with a two-minute
+   expiry.
+3. **Activation.** The agent calls `ActivateCredential`. The TPM releases the
    secret only if an object with the given name is loaded in the same TPM as
-   the EK. Returning the secret proves AK residency.
-6. **Completion.** On match, in one transaction: consume the challenge, store
-   the AK public key, move the node to `enrolled`, append `node.enroll` to the
-   audit ledger. If the audit append fails, the transaction aborts.
+   the EK. Returning the secret proves AK residency in the approved TPM.
+4. **Completion.** In one transaction the control plane consumes the
+   challenge, re-checks expiry, node, node state, EK certificate and
+   development-root policy, compares the secret hash in constant time, stores
+   the AK and moves the node to `enrolled`, and appends `node.enroll`. If any
+   write fails, nothing is recorded and enrollment fails.
 
-Any failure appends a `node.enroll.denied` audit entry with a reason code and
-leaves the node state unchanged.
+A challenge admits **one attempt**: a wrong secret, wrong node, expired
+challenge or failed re-check consumes it. Every denial at begin or completion
+appends `node.enroll.denied` with a reason code (`node_unknown`,
+`node_state_invalid`, `ak_invalid`, `ek_untrusted`, `ek_development_root`,
+`challenge_unknown`, `challenge_consumed`, `challenge_expired`,
+`challenge_wrong_node`, `activation_failed`, `ak_in_use`) and leaves the node
+state unchanged. Malformed node or challenge IDs are refused before any state
+is read, so attacker-chosen strings do not reach the ledger.
+
+### AK template
+
+The AK is an owner-hierarchy primary created from a fixed template: ECC P-256,
+ECDSA-SHA256, name algorithm SHA-256, no auth policy, attributes exactly
+`fixedTPM | fixedParent | sensitiveDataOrigin | userWithAuth | noDA |
+restricted | sign`. Because primaries are derived from the hierarchy seed, the
+agent recreates the same AK after every boot without storing a key blob or
+using a persistent handle. Clearing the owner hierarchy changes the AK, which
+requires re-enrollment.
 
 ## Node state machine
 
 ```
            register             activate OK
-  (none) ───────────▶ pending ─────────────▶ enrolled
-                        │                       │
-                 expiry │                       │ revoke
-                        ▼                       ▼
-                     expired                 revoked
+  (none) ───────────▶ registered ───────────▶ enrolled
+                          │                       │
+                          │ revoke                │ revoke
+                          ▼                       ▼
+                       revoked ◀──────────────────┘
 ```
 
-- There are no transitions out of `expired` or `revoked`. Re-enrolling the
-  same machine requires a new registration, which is a new audited operator
-  decision.
-- Revocation takes effect for the next attestation; identities already issued
-  expire according to their lifetime. Revocation of live identities is out of
-  scope for v1 and is why identity lifetimes must be short.
-- One EK maps to at most one non-terminal node record. One node has exactly
-  one active AK.
+- Database triggers enforce the transitions, forbid deletion, and make the
+  node ID, EK and enrolled AK immutable.
+- There are no transitions out of `revoked`. Re-admitting the same machine
+  requires a new registration under a new node ID, which is a new audited
+  operator decision.
+- Registrations do not expire in v1; an unused registration must be revoked.
+- Revocation takes effect for the next challenge and the next verification;
+  identities already issued expire according to their lifetime. Revocation of
+  live identities is out of scope for v1 and is why identity lifetimes must be
+  short.
+- One EK and one AK each map to at most one live node.
 
 ## Key lifecycle
 
@@ -110,21 +135,24 @@ leaves the node state unchanged.
 
 ## Development with `swtpm`
 
-`swtpm_setup` can create EK certificates signed by a locally generated CA.
-Those certificates prove nothing about hardware. The control plane must:
+`swtpm_setup` creates an RSA EK certificate signed by a locally generated CA.
+That certificate proves nothing about hardware. Attest therefore:
 
-- refuse non-hardware EK roots unless they are explicitly configured as
-  development roots;
-- record in every attestation result whether a development root was used;
-- never let development-root nodes satisfy a policy that requires hardware.
+- treats configured roots as either production or development; a chain is
+  tried against production roots first;
+- refuses development-root EKs at registration, enrollment and every
+  attestation unless the current measurement policy sets
+  `allow_development_roots`, so withdrawing that flag takes effect at once;
+- records development-root use on the node and in every attestation's audit
+  metadata (`development: true`).
 
-## Open decisions
+## Decisions
 
-- EK certificate availability varies across vendors and cloud vTPMs. Decide
-  whether an EK public-key hash without a certificate is acceptable, and under
-  which explicit configuration.
-- RSA-2048 vs ECC P-256 EK templates; support both or pick one for v1.
-- Whether the AK is persisted at a TPM handle or reloaded from a saved context
-  by the agent.
-- Library choice: `github.com/google/go-tpm` (low-level TPM 2.0) with or
-  without `github.com/google/go-attestation` helpers.
+| Question | Decision |
+| -------- | -------- |
+| EK without a certificate | Not supported in v1. An EK certificate chaining to a configured root is required. |
+| EK key types | RSA-2048 (TCG low range, NV index `0x01c00002`) and ECC NIST P-256 (`0x01c0000a`). ECC P-384 and the high-range templates are deferred. |
+| EK certificate encoding | DER, with trailing NV padding of all `0x00` or all `0xff` tolerated. The TCG critical subject-alternative-name containing only a directory name is accepted; any other unhandled critical extension is refused. |
+| EK certificate validity | Checked at registration and enrollment. An expired EK certificate cannot enroll; an already enrolled node keeps attesting with its enrolled AK. |
+| AK storage | Deterministic owner-hierarchy primary; nothing persisted (see above). |
+| TPM library | `github.com/google/go-tpm` for TPM commands and credential creation. `go-attestation`/`go-eventlog` are not used: their event-log replay accepts empty logs and unlogged PCRs and applies firmware workarounds, which conflicts with the fail-closed requirement. Attest has its own strict parser (`internal/eventlog`). |
