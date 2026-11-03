@@ -65,6 +65,12 @@ func ParseEKCert(b []byte) (*x509.Certificate, error) {
 	if err != nil {
 		return nil, wrap(ReasonEKCertInvalid, err)
 	}
+	// An EK certificate is an end-entity certificate (TCG EK Credential
+	// Profile: cA FALSE). Otherwise a trusted root or intermediate could be
+	// presented as an EK.
+	if cert.IsCA || cert.KeyUsage&x509.KeyUsageCertSign != 0 {
+		return nil, fail(ReasonEKCertInvalid, "certificate is a CA certificate")
+	}
 	// TCG EK certificates carry a critical subjectAltName holding only a
 	// directoryName (TPM manufacturer, model, version). Go's verifier
 	// leaves such a SAN unhandled; it is understood here, so mark it

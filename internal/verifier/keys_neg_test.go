@@ -5,6 +5,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/x509"
 	"testing"
 	"time"
 
@@ -97,6 +98,10 @@ func TestVerifyEKCertRejectsMore(t *testing.T) {
 	}{
 		{"not yet valid", ca.IssueEKCert(t, p256), roots, time.Now().Add(-48 * time.Hour), ReasonEKUntrusted},
 		{"trusted only as development, no dev pool", other.IssueEKCert(t, p256), EKRoots{Development: pool(ca)}, time.Now(), ReasonEKUntrusted},
+		{"root certificate as EK", ca.Cert.Raw, roots, time.Now(), ReasonEKCertInvalid},
+		{"CA-flagged EK", ca.IssueEKCert(t, p256, func(c *x509.Certificate) {
+			c.IsCA, c.BasicConstraintsValid = true, true
+		}), roots, time.Now(), ReasonEKCertInvalid},
 		{"RSA-4096 EK", ca.IssueEKCert(t, rsa4096.Public()), roots, time.Now(), ReasonEKCertInvalid},
 		{"Ed25519 EK", ca.IssueEKCert(t, edPub), roots, time.Now(), ReasonEKCertInvalid},
 		{"P-224 EK", ca.IssueEKCert(t, eccKey(t, elliptic.P224()).Public()), roots, time.Now(), ReasonEKCertInvalid},
