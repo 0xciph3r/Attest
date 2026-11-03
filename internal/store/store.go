@@ -19,7 +19,8 @@ import (
 	"strings"
 	"time"
 
-	_ "modernc.org/sqlite" // registers the "sqlite" driver
+	"modernc.org/sqlite" // registers the "sqlite" driver
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 //go:embed migrations/*.sql
@@ -50,11 +51,35 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		return nil, err
 	}
 	s := &Store{db: db}
-	if err := s.migrate(ctx); err != nil {
+	if err := s.migrateRetryingBusy(ctx); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
 	return s, nil
+}
+
+// openBusyTimeout bounds how long Open waits for another process that is
+// creating or migrating the same database.
+const openBusyTimeout = 10 * time.Second
+
+// migrateRetryingBusy runs migrate, retrying while SQLite reports the
+// database busy. When several processes open a new database at once, WAL
+// initialisation can fail with SQLITE_BUSY without consulting the busy
+// timeout. Each attempt is transactional, so retrying is safe.
+func (s *Store) migrateRetryingBusy(ctx context.Context) error {
+	deadline := time.Now().Add(openBusyTimeout)
+	for delay := time.Millisecond; ; delay = min(2*delay, 100*time.Millisecond) {
+		err := s.migrate(ctx)
+		var se *sqlite.Error
+		if err == nil || !errors.As(err, &se) || se.Code()&0xff != sqlite3.SQLITE_BUSY || time.Now().After(deadline) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(delay):
+		}
+	}
 }
 
 // OpenReadOnly opens an existing database without modifying it. It is used by
@@ -151,11 +176,22 @@ func (s *Store) migrate(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if _, err := s.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
+	// An immediate transaction takes the write lock up front; an autocommit
+	// statement would upgrade a read lock, which SQLite refuses with BUSY
+	// instead of waiting when another connection is migrating.
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("store: create schema_migrations: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
 		version    INTEGER PRIMARY KEY,
 		name       TEXT    NOT NULL,
 		applied_at INTEGER NOT NULL
 	) STRICT`); err != nil {
+		return fmt.Errorf("store: create schema_migrations: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("store: create schema_migrations: %w", err)
 	}
 	current, err := s.schemaVersion(ctx)
@@ -203,6 +239,15 @@ func (s *Store) apply(ctx context.Context, m migration) error {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	// The transaction holds the write lock, so this sees a migration that a
+	// concurrent Open applied after our history check.
+	var applied bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = ?)`, m.version).Scan(&applied); err != nil {
+		return fmt.Errorf("store: apply %s: %w", m.name, err)
+	}
+	if applied {
+		return nil
+	}
 	if _, err := tx.ExecContext(ctx, m.sql); err != nil {
 		return fmt.Errorf("store: apply %s: %w", m.name, err)
 	}

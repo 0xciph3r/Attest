@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/0xciph3r/attest/internal/store/storetest"
@@ -31,6 +32,40 @@ func TestFailedMigrationLeavesNoTrace(t *testing.T) {
 		t.Fatalf("reopen after failed migration: %v", err)
 	}
 	_ = s2.Close()
+}
+
+func TestConcurrentOpenOfFreshDatabase(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "attest.db")
+	const n = 8
+	errs := make(chan error, n)
+	var wg sync.WaitGroup
+	for range n {
+		wg.Go(func() {
+			s, err := Open(ctx, path)
+			if err == nil {
+				err = s.Close()
+			}
+			errs <- err
+		})
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Errorf("concurrent Open: %v", err)
+		}
+	}
+	ms, _ := loadMigrations()
+	s, err := OpenReadOnly(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+	var rows int
+	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM schema_migrations`).Scan(&rows); err != nil || rows != len(ms) {
+		t.Fatalf("%d migration rows, want %d (err %v)", rows, len(ms), err)
+	}
 }
 
 // The recorded history must be exactly this binary's migrations; a gap or a
