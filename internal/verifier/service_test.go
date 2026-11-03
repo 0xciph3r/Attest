@@ -19,6 +19,7 @@ var bg = context.Background()
 
 type svcEnv struct {
 	t    *testing.T
+	path string
 	st   *store.Store
 	svc  *Service
 	now  time.Time
@@ -27,12 +28,13 @@ type svcEnv struct {
 
 func newSvcEnv(t *testing.T) *svcEnv {
 	t.Helper()
-	st, err := store.Open(bg, filepath.Join(t.TempDir(), "attest.db"))
+	path := filepath.Join(t.TempDir(), "attest.db")
+	st, err := store.Open(bg, path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
-	e := &svcEnv{t: t, st: st, now: time.Now(), boot: eventlog.SimulatedBoot("v1")}
+	e := &svcEnv{t: t, path: path, st: st, now: time.Now(), boot: eventlog.SimulatedBoot("v1")}
 	if e.svc, err = NewService(ServiceConfig{Store: st, Now: func() time.Time { return e.now }}); err != nil {
 		t.Fatal(err)
 	}
