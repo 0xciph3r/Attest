@@ -301,6 +301,9 @@ func (s *Service) complete(tx *store.Tx, now time.Time, nodeID string, ch *store
 // Revoke permanently revokes a node. Re-admitting the machine requires a new
 // registration.
 func (s *Service) Revoke(ctx context.Context, actor, nodeID string) error {
+	if !policy.ValidNodeID(nodeID) {
+		return ErrInvalidNodeID
+	}
 	now := s.now()
 	return s.st.Update(ctx, func(tx *store.Tx) error {
 		if err := tx.RevokeNode(nodeID, now); err != nil {

@@ -236,3 +236,12 @@ func TestCompleteTTLBoundary(t *testing.T) {
 }
 
 func sum(b []byte) []byte { h := sha256.Sum256(b); return h[:] }
+
+func TestRevokeValidatesNodeID(t *testing.T) {
+	e := newEnv(t)
+	for _, id := range []string{"", "Node-1", "../node-1", "node-1\x00"} {
+		if err := e.svc.Revoke(ctx, "operator:alice", id); !errors.Is(err, ErrInvalidNodeID) {
+			t.Errorf("Revoke(%q) = %v, want ErrInvalidNodeID", id, err)
+		}
+	}
+}
