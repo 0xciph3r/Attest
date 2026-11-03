@@ -21,6 +21,9 @@ import (
 
 const (
 	headerSize = 10
+	// TPM 2.0 response tags.
+	tagNoSessions = 0x8001
+	tagSessions   = 0x8002
 	// maxResponse bounds the response size accepted from the TPM.
 	maxResponse = 1 << 16
 	// cmdInit is the swtpm control-channel CMD_INIT command.
@@ -34,6 +37,10 @@ type Conn struct {
 	mu       sync.Mutex
 	conn     net.Conn
 	ctrlAddr string
+	timeout  time.Duration
+	// broken is set once the stream position is unknown; later commands
+	// fail instead of reading a stale response.
+	broken error
 }
 
 var _ transport.TPMCloser = (*Conn)(nil)
@@ -45,14 +52,32 @@ func Dial(addr, ctrlAddr string) (*Conn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("swtpm: dial %s: %w", addr, err)
 	}
-	return &Conn{conn: c, ctrlAddr: ctrlAddr}, nil
+	return &Conn{conn: c, ctrlAddr: ctrlAddr, timeout: timeout}, nil
 }
 
-// Send transmits one TPM command and returns the complete response.
+// Send transmits one TPM command and returns the complete response. Any
+// I/O or framing error breaks the connection permanently.
 func (c *Conn) Send(cmd []byte) ([]byte, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if err := c.conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+	if c.broken != nil {
+		return nil, fmt.Errorf("swtpm: connection unusable after earlier error: %w", c.broken)
+	}
+	rsp, err := c.send(cmd)
+	if err != nil {
+		c.broken = err
+		_ = c.conn.Close()
+		return nil, err
+	}
+	return rsp, nil
+}
+
+func (c *Conn) send(cmd []byte) ([]byte, error) {
+	d := c.timeout
+	if d == 0 {
+		d = timeout
+	}
+	if err := c.conn.SetDeadline(time.Now().Add(d)); err != nil {
 		return nil, err
 	}
 	if _, err := c.conn.Write(cmd); err != nil {
@@ -61,6 +86,9 @@ func (c *Conn) Send(cmd []byte) ([]byte, error) {
 	hdr := make([]byte, headerSize)
 	if _, err := io.ReadFull(c.conn, hdr); err != nil {
 		return nil, fmt.Errorf("swtpm: read header: %w", err)
+	}
+	if tag := binary.BigEndian.Uint16(hdr[0:2]); tag != tagNoSessions && tag != tagSessions {
+		return nil, fmt.Errorf("swtpm: invalid response tag %#04x", tag)
 	}
 	n := binary.BigEndian.Uint32(hdr[2:6])
 	if n < headerSize || n > maxResponse {
