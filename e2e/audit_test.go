@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -217,4 +218,149 @@ func rewriteChain(t *testing.T, path string) {
 		}
 		head = audit.Head{Sequence: e.Sequence, Hash: e.Hash}
 	}
+}
+
+func TestAuditRejects(t *testing.T) {
+	dir := t.TempDir()
+	path := func(name string) string { return filepath.Join(dir, name) }
+	db, key, pub := path("attest.db"), path("auditor.key"), path("auditor.pub")
+	populate(t, db, 6)
+	expect(t, ctl(t, "audit", "keygen", "--key", key, "--pub", pub), 0, "key id")
+	cp := path("cp.json")
+	expect(t, ctl(t, "audit", "checkpoint", "--db", db, "--key", key, "-o", cp), 0, "seq=6")
+	export := path("export.jsonl")
+	expect(t, ctl(t, "audit", "export", "--db", db, "-o", export), 0, "exported 6")
+
+	read := func(p string) string {
+		b, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(b)
+	}
+	write := func(name, data string) string {
+		p := path(name)
+		if err := os.WriteFile(p, []byte(data), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	lines := strings.SplitAfter(read(export), "\n")
+	lines = lines[:len(lines)-1] // trailing ""
+	join := func(ls ...string) string { return strings.Join(ls, "") }
+	swapField := func(line, field, from, to string) string {
+		return strings.Replace(line, `"`+field+`":`+from, `"`+field+`":`+to, 1)
+	}
+	verifyExport := func(data string) result {
+		return ctl(t, "audit", "verify", "--input", write("t.jsonl", data), "--pubkey", pub, "--checkpoint", cp)
+	}
+
+	t.Run("tampered export", func(t *testing.T) {
+		otherHash := strings.Repeat("0", 64)
+		for _, tc := range []struct{ name, data, want string }{
+			{"reordered", join(lines[0], lines[2], lines[1], join(lines[3:]...)), "sequence discontinuity"},
+			{"duplicated", join(lines[0], lines[1], lines[1], join(lines[2:]...)), "sequence discontinuity"},
+			{"deleted middle", join(lines[0], join(lines[2:]...)), "sequence discontinuity"},
+			{"deleted last", join(lines[:5]...), "truncated"},
+			{"empty", "", "truncated"},
+			{"truncated mid-line", join(lines...)[:len(join(lines...))-10], "malformed"},
+			{"renumbered", join(lines[0], swapField(lines[1], "seq", "2", "3"), join(lines[2:]...)), "sequence discontinuity"},
+			{"altered hash", join(lines[0], lines[1], swapJSON(lines[2], "hash", otherHash), join(lines[3:]...)), "entry hash mismatch at sequence 3"},
+			{"altered prev_hash", join(lines[0], swapJSON(lines[1], "prev_hash", otherHash), join(lines[2:]...)), "previous-hash mismatch"},
+			{"altered object", join(lines[0], strings.Replace(lines[1], "node/1", "node/X", 1), join(lines[2:]...)), "entry hash mismatch"},
+			{"garbage appended", join(join(lines...), "garbage\n"), "malformed"},
+			{"extra entry appended", join(join(lines...), lines[5]), "sequence discontinuity"},
+			{"duplicate key", join(strings.Replace(lines[0], `"actor":`, `"actor":"x","actor":`, 1), join(lines[1:]...)), "malformed"},
+			{"case-variant key", join(strings.Replace(lines[0], `"actor":`, `"ACTOR":`, 1), join(lines[1:]...)), "malformed"},
+			{"blank line", join(lines[0], "\n", join(lines[1:]...)), "malformed"},
+		} {
+			t.Run(tc.name, func(t *testing.T) { expect(t, verifyExport(tc.data), 1, tc.want) })
+		}
+	})
+
+	t.Run("tampered checkpoint", func(t *testing.T) {
+		good := read(cp)
+		otherKey, otherPub := path("other.key"), path("other.pub")
+		expect(t, ctl(t, "audit", "keygen", "--key", otherKey, "--pub", otherPub), 0, "key id")
+		otherCP := path("other-cp.json")
+		expect(t, ctl(t, "audit", "checkpoint", "--db", db, "--key", otherKey, "-o", otherCP), 0, "seq=6")
+
+		otherDB := path("other.db")
+		populate(t, otherDB, 6)
+		foreignCP := path("foreign-cp.json")
+		expect(t, ctl(t, "audit", "checkpoint", "--db", otherDB, "--key", key, "-o", foreignCP), 0, "seq=6")
+
+		for _, tc := range []struct {
+			name, file, want string
+		}{
+			{"signed by untrusted key", otherCP, "untrusted key"},
+			{"for another ledger", foreignCP, "does not match trusted checkpoint"},
+			{"sequence lowered", write("c1.json", strings.Replace(good, `"sequence": 6`, `"sequence": 5`, 1)), "invalid checkpoint signature"},
+			{"time moved", write("c2.json", strings.Replace(good, `"time": "20`, `"time": "19`, 1)), "invalid checkpoint signature"},
+			{"signature emptied", write("c3.json", swapJSON(good, "signature", "")), "invalid checkpoint signature"},
+			{"signature not base64", write("c3b.json", swapJSON(good, "signature", "!!")), "malformed checkpoint"},
+			{"unknown field", write("c4.json", strings.Replace(good, "{", `{"trusted": true,`, 1)), "malformed checkpoint"},
+			{"duplicate key", write("c5.json", strings.Replace(good, "{", `{"sequence": 1,`, 1)), "malformed checkpoint"},
+			{"truncated", write("c6.json", good[:len(good)/2]), "malformed checkpoint"},
+			{"two objects", write("c7.json", good+good), "malformed checkpoint"},
+			{"empty", write("c8.json", ""), "malformed checkpoint"},
+			{"oversized", write("c9.json", good+strings.Repeat(" ", 20<<10)), "malformed checkpoint"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				expect(t, ctl(t, "audit", "verify", "--db", db, "--pubkey", pub, "--checkpoint", tc.file), 1, tc.want)
+			})
+		}
+		// One bad checkpoint among good ones still fails.
+		expect(t, ctl(t, "audit", "verify", "--db", db, "--pubkey", pub, "--checkpoint", cp, "--checkpoint", foreignCP), 1, "conflict")
+	})
+
+	t.Run("checkpoint refuses to extend untrusted history", func(t *testing.T) {
+		rewritten := path("rewritten.db")
+		copyDB(t, db, rewritten)
+		rewriteChain(t, rewritten)
+		out := path("never.json")
+		expect(t, ctl(t, "audit", "checkpoint", "--db", rewritten, "--key", key, "--checkpoint", cp, "-o", out), 1, "does not match")
+		if _, err := os.Stat(out); !os.IsNotExist(err) {
+			t.Fatal("checkpoint written for a ledger that failed verification")
+		}
+	})
+
+	t.Run("operational errors", func(t *testing.T) {
+		corrupt := write("corrupt.db", strings.Repeat("not a database ", 512))
+		for _, tc := range []struct {
+			name string
+			args []string
+		}{
+			{"input is a directory", []string{"audit", "verify", "--input", dir, "--allow-unanchored"}},
+			{"missing checkpoint file", []string{"audit", "verify", "--db", db, "--pubkey", pub, "--checkpoint", path("nope.json")}},
+			{"checkpoint without pubkey", []string{"audit", "verify", "--db", db, "--checkpoint", cp}},
+			{"pubkey is private key", []string{"audit", "verify", "--db", db, "--pubkey", key, "--checkpoint", cp}},
+			{"pubkey is a directory", []string{"audit", "verify", "--db", db, "--pubkey", dir, "--checkpoint", cp}},
+			{"corrupt database", []string{"audit", "verify", "--db", corrupt, "--allow-unanchored"}},
+			{"db and input", []string{"audit", "verify", "--db", db, "--input", export, "--allow-unanchored"}},
+			{"no source", []string{"audit", "verify", "--allow-unanchored"}},
+			{"export over existing file", []string{"audit", "export", "--db", db, "-o", export}},
+			{"checkpoint into missing dir", []string{"audit", "checkpoint", "--db", db, "--key", key, "-o", path("missing/cp.json")}},
+			{"checkpoint key is public", []string{"audit", "checkpoint", "--db", db, "--key", pub, "-o", path("cp-pub.json")}},
+			{"keygen same path", []string{"audit", "keygen", "--key", path("same"), "--pub", path("same")}},
+		} {
+			t.Run(tc.name, func(t *testing.T) { expect(t, ctl(t, tc.args...), 2, "error") })
+		}
+		if read(export) != join(lines...) {
+			t.Fatal("refused export modified the existing file")
+		}
+		if _, err := os.Stat(path("same")); !os.IsNotExist(err) {
+			t.Fatal("failed keygen left a private key behind")
+		}
+	})
+}
+
+// swapJSON replaces the string value of field in a JSON document, written
+// compactly or indented.
+func swapJSON(doc, field, value string) string {
+	re := regexp.MustCompile(`("` + field + `":\s*")[^"]*"`)
+	if !re.MatchString(doc) {
+		panic("field " + field + " not found")
+	}
+	return re.ReplaceAllString(doc, "${1}"+value+`"`)
 }
