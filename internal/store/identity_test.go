@@ -3,13 +3,12 @@ package store
 import (
 	"database/sql"
 	"errors"
-	"fmt"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/0xciph3r/attest/internal/audit"
+	"github.com/0xciph3r/attest/internal/store/storetest"
 )
 
 // identityFixture creates an enrolled node with one passing attestation
@@ -198,30 +197,7 @@ func TestMigration0003PreservesPolicies(t *testing.T) {
 
 // dumpTables returns every row of every application table, for checking
 // that rejected writes changed nothing.
-func dumpTables(t *testing.T, db *sql.DB) string {
-	t.Helper()
-	var out strings.Builder
-	for _, table := range []string{"audit_entries", "policies", "nodes", "enrollment_challenges", "attest_challenges", "attestations", "identity_records"} {
-		rows, err := db.Query(`SELECT * FROM ` + table + ` ORDER BY rowid`)
-		if err != nil {
-			t.Fatal(err)
-		}
-		cols, _ := rows.Columns()
-		for rows.Next() {
-			vals := make([]any, len(cols))
-			ptrs := make([]any, len(cols))
-			for i := range vals {
-				ptrs[i] = &vals[i]
-			}
-			if err := rows.Scan(ptrs...); err != nil {
-				t.Fatal(err)
-			}
-			fmt.Fprintf(&out, "%s %v\n", table, vals)
-		}
-		_ = rows.Close()
-	}
-	return out.String()
-}
+func dumpTables(t *testing.T, db *sql.DB) string { return storetest.DumpDB(t, db) }
 
 func TestSchemaRefusesReplace(t *testing.T) {
 	s, path := openTemp(t)
