@@ -62,7 +62,8 @@ const maxLineSize = 3*6*MaxFieldSize + (MaxMetadataSize+2)/3*4 + 1024
 // ReadJSONL streams entries from a JSON Lines export, one object per line
 // exactly as WriteJSONL writes them. A line that is blank, too long, carries
 // duplicate, case-variant or unknown keys, or holds more than one value is
-// rejected so that a malformed or foreign file is not silently accepted.
+// rejected with ErrMalformedEntry so that a malformed or foreign file is not
+// silently accepted. Read errors are returned as they are.
 func ReadJSONL(r io.Reader) iter.Seq2[Entry, error] {
 	return func(yield func(Entry, error) bool) {
 		sc := bufio.NewScanner(r)
@@ -71,7 +72,7 @@ func ReadJSONL(r io.Reader) iter.Seq2[Entry, error] {
 		for line := 1; sc.Scan(); line++ {
 			var je jsonEntry
 			if err := strictjson.Decode(sc.Bytes(), &je); err != nil {
-				yield(Entry{}, fmt.Errorf("audit: export line %d: %w", line, err))
+				yield(Entry{}, fmt.Errorf("%w: export line %d: %w", ErrMalformedEntry, line, err))
 				return
 			}
 			e := Entry{
@@ -88,7 +89,10 @@ func ReadJSONL(r io.Reader) iter.Seq2[Entry, error] {
 				return
 			}
 		}
-		if err := sc.Err(); err != nil {
+		switch err := sc.Err(); {
+		case errors.Is(err, errUnterminated), errors.Is(err, bufio.ErrTooLong):
+			yield(Entry{}, fmt.Errorf("%w: export: %w", ErrMalformedEntry, err))
+		case err != nil:
 			yield(Entry{}, fmt.Errorf("audit: reading export: %w", err))
 		}
 	}
