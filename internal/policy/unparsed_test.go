@@ -2,6 +2,7 @@ package policy
 
 import (
 	"bytes"
+	"strings"
 	"testing"
 )
 
@@ -39,5 +40,20 @@ func TestUnparsedPoliciesFailClosed(t *testing.T) {
 		if w, err := p.Match(Caller{"n1", "a.service", 1000}); err == nil {
 			t.Errorf("%s: identified %v", name, w)
 		}
+	}
+}
+
+func TestDigestIgnoresHexCase(t *testing.T) {
+	doc := `{"schema":"attest.dev/measurement-policy/v1","pcrs":[0],"references":[{"name":"a","pcrs":{"0":"` + strings.Repeat("ab", 32) + `"}}]}`
+	a, err := ParseMeasurement([]byte(doc))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := ParseMeasurement([]byte(strings.ReplaceAll(doc, "ab", "AB")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(a.Digest(), b.Digest()) {
+		t.Fatal("hex case changed the digest of an identical policy")
 	}
 }

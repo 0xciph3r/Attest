@@ -135,6 +135,7 @@ func (m *Measurement) validate() error {
 				return fmt.Errorf("%w: reference %q: PCR %s must be 64 hex characters", ErrInvalid, r.Name, k)
 			}
 			r.values[uint32(idx)] = b
+			r.PCRs[k] = hex.EncodeToString(b)
 		}
 	}
 	return nil
