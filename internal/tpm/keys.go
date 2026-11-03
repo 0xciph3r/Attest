@@ -168,7 +168,12 @@ func ReadEKCert(t transport.TPM, typ EKType) ([]byte, error) {
 		if err != nil {
 			return nil, fmt.Errorf("tpm: read EK certificate: %w", err)
 		}
+		// A short read would otherwise loop forever and a long one would
+		// misalign every later offset.
+		if len(rsp.Data.Buffer) != n {
+			return nil, fmt.Errorf("tpm: EK certificate read returned %d bytes, want %d", len(rsp.Data.Buffer), n)
+		}
 		out = append(out, rsp.Data.Buffer...)
 	}
-	return out[:size], nil
+	return out, nil
 }
