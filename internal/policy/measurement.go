@@ -60,28 +60,46 @@ type Measurement struct {
 
 // ParseMeasurement strictly decodes and validates a measurement policy.
 func ParseMeasurement(data []byte) (*Measurement, error) {
-	if len(data) > MaxPolicySize {
-		return nil, fmt.Errorf("%w: larger than %d bytes", ErrInvalid, MaxPolicySize)
-	}
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.DisallowUnknownFields()
 	var m Measurement
-	if err := dec.Decode(&m); err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrInvalid, err)
-	}
-	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
-		return nil, fmt.Errorf("%w: trailing data", ErrInvalid)
+	if err := decodeStrict(data, &m); err != nil {
+		return nil, err
 	}
 	if err := m.validate(); err != nil {
 		return nil, err
 	}
-	canonical, err := json.Marshal(&m)
+	var err error
+	if m.digest, err = canonicalDigest(&m); err != nil {
+		return nil, err
+	}
+	return &m, nil
+}
+
+// decodeStrict decodes exactly one JSON value, rejecting unknown fields,
+// trailing data and oversized documents.
+func decodeStrict(data []byte, v any) error {
+	if len(data) > MaxPolicySize {
+		return fmt.Errorf("%w: larger than %d bytes", ErrInvalid, MaxPolicySize)
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(v); err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalid, err)
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return fmt.Errorf("%w: trailing data", ErrInvalid)
+	}
+	return nil
+}
+
+// canonicalDigest is the SHA-256 of a validated policy's re-encoding, so
+// formatting differences do not change the digest.
+func canonicalDigest(v any) ([]byte, error) {
+	canonical, err := json.Marshal(v)
 	if err != nil {
 		return nil, err
 	}
 	d := sha256.Sum256(canonical)
-	m.digest = d[:]
-	return &m, nil
+	return d[:], nil
 }
 
 func (m *Measurement) validate() error {
