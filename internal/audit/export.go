@@ -2,12 +2,15 @@ package audit
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"iter"
 	"time"
+
+	"github.com/0xciph3r/attest/internal/strictjson"
 )
 
 // jsonEntry is the JSON Lines export representation of an Entry. Metadata is
@@ -51,20 +54,24 @@ func WriteJSONL(w io.Writer, entries iter.Seq2[Entry, error]) (uint64, error) {
 	return n, bw.Flush()
 }
 
-// ReadJSONL streams entries from a JSON Lines export. Unknown fields are
+// maxLineSize bounds one export line: three fields of MaxFieldSize bytes,
+// each of which JSON may escape to six bytes per byte, base64 metadata, and
+// the fixed fields.
+const maxLineSize = 3*6*MaxFieldSize + (MaxMetadataSize+2)/3*4 + 1024
+
+// ReadJSONL streams entries from a JSON Lines export, one object per line
+// exactly as WriteJSONL writes them. A line that is blank, too long, carries
+// duplicate, case-variant or unknown keys, or holds more than one value is
 // rejected so that a malformed or foreign file is not silently accepted.
 func ReadJSONL(r io.Reader) iter.Seq2[Entry, error] {
 	return func(yield func(Entry, error) bool) {
-		dec := json.NewDecoder(bufio.NewReader(r))
-		dec.DisallowUnknownFields()
-		for line := 1; ; line++ {
+		sc := bufio.NewScanner(r)
+		sc.Buffer(make([]byte, 0, 64<<10), maxLineSize)
+		sc.Split(scanLines)
+		for line := 1; sc.Scan(); line++ {
 			var je jsonEntry
-			err := dec.Decode(&je)
-			if errors.Is(err, io.EOF) {
-				return
-			}
-			if err != nil {
-				yield(Entry{}, fmt.Errorf("audit: export record %d: %w", line, err))
+			if err := strictjson.Decode(sc.Bytes(), &je); err != nil {
+				yield(Entry{}, fmt.Errorf("audit: export line %d: %w", line, err))
 				return
 			}
 			e := Entry{
@@ -81,7 +88,24 @@ func ReadJSONL(r io.Reader) iter.Seq2[Entry, error] {
 				return
 			}
 		}
+		if err := sc.Err(); err != nil {
+			yield(Entry{}, fmt.Errorf("audit: reading export: %w", err))
+		}
 	}
+}
+
+var errUnterminated = errors.New("last line is not newline-terminated (truncated export?)")
+
+// scanLines splits on '\n'. Unlike bufio.ScanLines it rejects an
+// unterminated final line, which is what a truncated export looks like.
+func scanLines(data []byte, atEOF bool) (int, []byte, error) {
+	if i := bytes.IndexByte(data, '\n'); i >= 0 {
+		return i + 1, data[:i], nil
+	}
+	if atEOF && len(data) > 0 {
+		return 0, nil, errUnterminated
+	}
+	return 0, nil, nil
 }
 
 // Slice adapts an in-memory slice to the iterator form accepted by Verify.

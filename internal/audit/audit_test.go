@@ -5,12 +5,14 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"errors"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+	"testing/iotest"
 	"time"
 )
 
@@ -388,8 +390,75 @@ func TestJSONLRoundTrip(t *testing.T) {
 		t.Fatalf("round trip: %v", err)
 	}
 
-	if _, err := Verify(ReadJSONL(bytes.NewBufferString(`{"seq":1,"bogus":true}`)), VerifyOptions{AllowUnanchored: true}); err == nil {
+	if _, err := Verify(ReadJSONL(bytes.NewBufferString(`{"seq":1,"bogus":true}`+"\n")), VerifyOptions{AllowUnanchored: true}); err == nil {
 		t.Fatal("unknown fields must be rejected")
+	}
+}
+
+func TestReadJSONLRejects(t *testing.T) {
+	entries := buildChain(t, 3)
+	var buf bytes.Buffer
+	if _, err := WriteJSONL(&buf, Slice(entries)); err != nil {
+		t.Fatal(err)
+	}
+	export := buf.String()
+	lines := strings.SplitAfter(export, "\n")
+	first := strings.TrimSuffix(lines[0], "\n")
+	unanchored := VerifyOptions{AllowUnanchored: true}
+
+	for name, doc := range map[string]string{
+		"unterminated last line": strings.TrimSuffix(export, "\n"),
+		"truncated mid-line":     export[:len(export)-20],
+		"blank line":             lines[0] + "\n" + lines[1] + lines[2],
+		"leading blank line":     "\n" + export,
+		"two values on a line":   first + first + "\n",
+		"value split over lines": strings.Replace(lines[0], `,"actor"`, "\n,\"actor\"", 1),
+		"duplicate key":          strings.Replace(lines[0], `{"seq":1,`, `{"seq":1,"seq":1,`, 1),
+		"case-variant key":       strings.Replace(lines[0], `"actor":`, `"Actor":`, 1),
+		"unknown key":            strings.Replace(lines[0], `{"seq":1,`, `{"seq":1,"note":"x",`, 1),
+		"uppercase hash":         strings.Replace(lines[0], entries[0].Hash.String(), strings.ToUpper(entries[0].Hash.String()), 1),
+		"short hash":             strings.Replace(lines[0], entries[0].Hash.String(), entries[0].Hash.String()[:62], 1),
+		"negative seq":           strings.Replace(lines[0], `{"seq":1,`, `{"seq":-1,`, 1),
+		"string seq":             strings.Replace(lines[0], `{"seq":1,`, `{"seq":"1",`, 1),
+		"seq overflow":           strings.Replace(lines[0], `{"seq":1,`, `{"seq":18446744073709551616,`, 1),
+		"bad base64 metadata":    strings.Replace(lines[0], `"metadata":"`, `"metadata":"!`, 1),
+		"bad time":               strings.Replace(lines[0], `"time":"2026`, `"time":"26`, 1),
+		"array line":             "[" + first + "]\n",
+		"null line":              "null\n",
+		"oversized line":         `{"seq":1,"actor":"` + strings.Repeat("a", maxLineSize) + `"}` + "\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Verify(ReadJSONL(strings.NewReader(doc)), unanchored); err == nil {
+				t.Fatal("accepted")
+			}
+		})
+	}
+
+	// The largest entry Next accepts must survive export and import.
+	big, err := Next(Head{}, Record{
+		Time:     t0,
+		Actor:    strings.Repeat("\x01", MaxFieldSize), // escaped to \u0001 in JSON
+		Action:   strings.Repeat("<", MaxFieldSize),
+		Object:   strings.Repeat("\u2028", MaxFieldSize/3),
+		Metadata: bytes.Repeat([]byte{0xff}, MaxMetadataSize),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	buf.Reset()
+	if _, err := WriteJSONL(&buf, Slice([]Entry{big})); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Verify(ReadJSONL(&buf), unanchored); err != nil {
+		t.Fatalf("maximum entry: %v", err)
+	}
+}
+
+func TestReadJSONLPropagatesReadErrors(t *testing.T) {
+	boom := errors.New("disk read failed")
+	r := io.MultiReader(strings.NewReader(`{"seq":1`), iotest.ErrReader(boom))
+	if _, err := Verify(ReadJSONL(r), VerifyOptions{AllowUnanchored: true}); !errors.Is(err, boom) {
+		t.Fatalf("got %v", err)
 	}
 }
 
