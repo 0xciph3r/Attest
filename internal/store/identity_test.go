@@ -100,6 +100,24 @@ func TestIdentityRecords(t *testing.T) {
 		}
 	}
 
+	mismatched := workloadID("00000000000000000000000000000009", node, now.Add(time.Minute))
+	mismatched.AttestationID = attID + 1
+	otherNode := workloadID("0000000000000000000000000000000a", node, now.Add(time.Minute))
+	otherNode.NodeID = "n2"
+	mustUpdate(t, s, func(tx *Tx) error { return tx.InsertNode(testNode("n2", 2)) })
+	for name, id := range map[string]*Identity{
+		"workload bound to another attestation": mismatched,
+		"workload claiming another node":        otherNode,
+	} {
+		if err := insert(id); !errors.Is(err, ErrConflict) {
+			t.Errorf("%s: got %v", name, err)
+		}
+	}
+	// Expiring exactly with the parent is allowed.
+	if err := insert(workloadID("0000000000000000000000000000000b", node, now.Add(time.Hour))); err != nil {
+		t.Fatalf("workload expiring with its parent: %v", err)
+	}
+
 	mustUpdate(t, s, func(tx *Tx) error { return tx.RevokeIdentity(node, now) })
 	if err := update(t, s, func(tx *Tx) error { return tx.RevokeIdentity(node, now) }); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("second revoke: %v", err)
@@ -282,5 +300,47 @@ func TestSchemaRefusesReplace(t *testing.T) {
 				t.Errorf("rejected writes changed the database:\nbefore:\n%s\nafter:\n%s", before, after)
 			}
 		})
+	}
+}
+
+func TestIdentityRequiresEnrolledNode(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	nodeIdentity := func(attID int64) *Identity {
+		return &Identity{Serial: "00000000000000000000000000000001", Kind: IdentityNode, SPIFFEID: "spiffe://td/attest/node/n1",
+			NodeID: "n1", AttestationID: attID, PublicKeyHash: digest(7), Issuer: "ca1", IssuedAt: now, NotBefore: now,
+			NotAfter: now.Add(time.Hour)}
+	}
+
+	// Revoking the node after a passing attestation blocks issuing its
+	// node identity.
+	s, _ := openTemp(t)
+	attID, nextSeq := identityFixture(t, s)
+	mustUpdate(t, s, func(tx *Tx) error { return tx.RevokeNode("n1", now) })
+	err := update(t, s, func(tx *Tx) error {
+		id := nodeIdentity(attID)
+		id.AuditSeq = nextSeq(tx)
+		return tx.InsertIdentity(id)
+	})
+	if !errors.Is(err, ErrConflict) {
+		t.Fatalf("node identity for revoked node: %v", err)
+	}
+
+	// Revoking the node blocks workload identities under a live parent.
+	s, _ = openTemp(t)
+	attID, nextSeq = identityFixture(t, s)
+	mustUpdate(t, s, func(tx *Tx) error {
+		id := nodeIdentity(attID)
+		id.AuditSeq = nextSeq(tx)
+		return tx.InsertIdentity(id)
+	})
+	mustUpdate(t, s, func(tx *Tx) error { return tx.RevokeNode("n1", now) })
+	err = update(t, s, func(tx *Tx) error {
+		return tx.InsertIdentity(&Identity{Serial: "00000000000000000000000000000002", Kind: IdentityWorkload,
+			SPIFFEID: "spiffe://td/workload/api", NodeID: "n1", Workload: "api", ParentSerial: "00000000000000000000000000000001",
+			AttestationID: attID, PolicyVersion: 2, PublicKeyHash: digest(3), Issuer: "ca1", IssuedAt: now, NotBefore: now,
+			NotAfter: now.Add(time.Minute), AuditSeq: nextSeq(tx)})
+	})
+	if !errors.Is(err, ErrConflict) {
+		t.Fatalf("workload identity on revoked node: %v", err)
 	}
 }

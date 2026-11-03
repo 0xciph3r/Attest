@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -189,6 +190,40 @@ func TestChallengesAreSingleUse(t *testing.T) {
 		return tx.InsertAttestChallenge(&AttestChallenge{ID: "a4", NodeID: "n1", NonceHash: digest(4), IssuedAt: now, ExpiresAt: now.Add(time.Minute)})
 	})
 	rejectedByConstraint(t, s, "nonce rewritten", `UPDATE attest_challenges SET nonce_hash = zeroblob(32), consumed_at = 1 WHERE id = 'a4'`)
+}
+
+func TestConcurrentChallengeConsumption(t *testing.T) {
+	s, _ := openTemp(t)
+	now := time.Now()
+	mustUpdate(t, s, func(tx *Tx) error {
+		if err := tx.InsertNode(testNode("n1", 1)); err != nil {
+			return err
+		}
+		return tx.InsertAttestChallenge(&AttestChallenge{ID: "a1", NodeID: "n1", NonceHash: digest(3), IssuedAt: now, ExpiresAt: now.Add(time.Minute)})
+	})
+	const workers = 16
+	var (
+		wg   sync.WaitGroup
+		mu   sync.Mutex
+		wins int
+	)
+	for range workers {
+		wg.Go(func() {
+			err := update(t, s, func(tx *Tx) error { return tx.ConsumeAttestChallenge("a1", now) })
+			switch {
+			case err == nil:
+				mu.Lock()
+				wins++
+				mu.Unlock()
+			case !errors.Is(err, ErrConsumed):
+				t.Errorf("unexpected error: %v", err)
+			}
+		})
+	}
+	wg.Wait()
+	if wins != 1 {
+		t.Fatalf("challenge consumed %d times", wins)
+	}
 }
 
 func TestAttestationsAndPolicies(t *testing.T) {
