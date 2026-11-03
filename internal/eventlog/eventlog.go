@@ -150,8 +150,14 @@ func Parse(raw []byte) (*Log, error) {
 				if sawLocality || len(log.Events) > 0 {
 					return nil, fmt.Errorf("%w: misplaced StartupLocality event", ErrMalformed)
 				}
+				// The TPM resets PCR 0 to the startup locality, which is 0, 3
+				// or 4 (H-CRTM).
+				loc := ev.Data[len(ev.Data)-1]
+				if loc != 0 && loc != 3 && loc != 4 {
+					return nil, fmt.Errorf("%w: StartupLocality %d", ErrMalformed, loc)
+				}
 				sawLocality = true
-				log.locality = ev.Data[len(ev.Data)-1]
+				log.locality = loc
 			}
 			continue
 		}

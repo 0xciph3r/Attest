@@ -328,6 +328,40 @@ func TestEventRejects(t *testing.T) {
 	}
 }
 
+func TestLocalityRules(t *testing.T) {
+	loc := func(v byte) []byte { return append([]byte("StartupLocality\x00"), v) }
+	z := make([]byte, 32)
+	for _, v := range []byte{1, 2, 5, 0xff} {
+		b := NewBuilder()
+		b.Append(0, EvNoAction, z, loc(v))
+		if _, err := Parse(b.Bytes()); !errors.Is(err, ErrMalformed) {
+			t.Errorf("locality %d: %v", v, err)
+		}
+	}
+	twice := NewBuilder()
+	twice.Append(0, EvNoAction, z, loc(3))
+	twice.Append(0, EvNoAction, z, loc(0))
+	late := NewBuilder()
+	late.Measure(0, EvPostCode, []byte("fw"))
+	late.Append(0, EvNoAction, z, loc(3))
+	for name, b := range map[string]*Builder{"twice": twice, "after measurements": late} {
+		if _, err := Parse(b.Bytes()); !errors.Is(err, ErrMalformed) {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	// A StartupLocality event for another PCR, or with extra data, is an
+	// ordinary EV_NO_ACTION event and leaves PCR 0 at zero.
+	for name, b := range map[string]*Builder{
+		"other pcr":  func() *Builder { b := NewBuilder(); b.Append(1, EvNoAction, z, loc(3)); return b }(),
+		"extra data": func() *Builder { b := NewBuilder(); b.Append(0, EvNoAction, z, append(loc(3), 0)); return b }(),
+	} {
+		b.Measure(0, EvPostCode, []byte("fw"))
+		if _, err := ParseAndReplay(b.Bytes(), b.PCRs(0)); err != nil {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+}
+
 func TestNoActionMidLogIgnored(t *testing.T) {
 	b := NewBuilder()
 	b.Measure(0, EvPostCode, []byte("a"))
