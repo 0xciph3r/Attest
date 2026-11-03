@@ -23,7 +23,7 @@ func DumpDB(t testing.TB, db *sql.DB) string {
 	t.Helper()
 	var out strings.Builder
 	for _, table := range Tables {
-		rows, err := db.Query(`SELECT * FROM ` + table + ` ORDER BY rowid`)
+		rows, err := db.Query(`SELECT * FROM ` + table + ` ORDER BY rowid`) //nolint:gosec // fixed table names
 		if err != nil {
 			t.Fatal(err)
 		}
