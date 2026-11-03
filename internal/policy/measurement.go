@@ -13,10 +13,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"maps"
 	"slices"
 	"strconv"
+
+	"github.com/0xciph3r/attest/internal/strictjson"
 )
 
 // SchemaMeasurementV1 identifies the measurement policy format.
@@ -74,19 +75,15 @@ func ParseMeasurement(data []byte) (*Measurement, error) {
 	return &m, nil
 }
 
-// decodeStrict decodes exactly one JSON value, rejecting unknown fields,
-// trailing data and oversized documents.
+// decodeStrict decodes exactly one JSON value, rejecting oversized
+// documents and everything strictjson rejects (duplicate or case-variant
+// keys, unknown fields, trailing data).
 func decodeStrict(data []byte, v any) error {
 	if len(data) > MaxPolicySize {
 		return fmt.Errorf("%w: larger than %d bytes", ErrInvalid, MaxPolicySize)
 	}
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(v); err != nil {
+	if err := strictjson.Decode(data, v); err != nil {
 		return fmt.Errorf("%w: %w", ErrInvalid, err)
-	}
-	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
-		return fmt.Errorf("%w: trailing data", ErrInvalid)
 	}
 	return nil
 }

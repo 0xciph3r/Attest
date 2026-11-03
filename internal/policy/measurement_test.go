@@ -55,6 +55,10 @@ func TestEvaluate(t *testing.T) {
 		{"no match", pcrs(map[uint32]string{0: v1, 7: v1}), "", ErrMeasurementNotAllowed},
 		{"missing PCR", pcrs(map[uint32]string{0: v1}), "", ErrMeasurementNotAllowed},
 		{"extra PCR", pcrs(map[uint32]string{0: v1, 7: v2, 8: v0}), "", ErrMeasurementNotAllowed},
+		{"nil map", nil, "", ErrMeasurementNotAllowed},
+		{"truncated value", map[uint32][]byte{0: pcrs(map[uint32]string{0: v1})[0][:31], 7: pcrs(map[uint32]string{0: v2})[0]}, "", ErrMeasurementNotAllowed},
+		{"extended value", map[uint32][]byte{0: append(pcrs(map[uint32]string{0: v2})[0], 0), 7: nil}, "", ErrMeasurementNotAllowed},
+		{"nil values", map[uint32][]byte{0: nil, 7: nil}, "", ErrMeasurementNotAllowed},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -96,6 +100,30 @@ func TestParseRejects(t *testing.T) {
 		"trailing data":      base + `{}`,
 		"duplicate ref name": strings.Replace(base, `}]}`, `},{"name":"a","pcrs":{"7":"`+v1+`"}}]}`, 1),
 		"oversized":          base + strings.Repeat(" ", MaxPolicySize),
+		// encoding/json would keep the last value; a reviewer reads the first.
+		"duplicate dev roots": strings.Replace(base, `"pcrs":[0,7]`, `"allow_development_roots":false,"pcrs":[0,7],"allow_development_roots":true`, 1),
+		"case-variant key":    strings.Replace(base, `"pcrs":[0,7]`, `"pcrs":[0,7],"PCRS":[0]`, 1),
+		"capitalised key":     strings.Replace(base, `"pcrs":[0,7]`, `"pcrs":[0,7],"Allow_Development_Roots":true`, 1),
+		"duplicate ref pcr":   strings.Replace(base, `{"0":"`+v1+`"}`, `{"0":"`+v1+`","0":"`+v2+`"}`, 1),
+		"duplicate schema":    strings.Replace(base, `"pcrs":[0,7]`, `"pcrs":[0,7],"schema":"attest.dev/measurement-policy/v1"`, 1),
+		"null pcrs":           strings.Replace(base, `[0,7]`, `null`, 1),
+		"pcr as string":       strings.Replace(base, `[0,7]`, `["0",7]`, 1),
+		"negative pcr":        strings.Replace(base, `[0,7]`, `[-1,7]`, 1),
+		"fractional pcr":      strings.Replace(base, `[0,7]`, `[0.5,7]`, 1),
+		"exponent pcr":        strings.Replace(base, `[0,7]`, `[0,7e0]`, 1),
+		"huge pcr":            strings.Replace(base, `[0,7]`, `[0,4294967296]`, 1),
+		"pcr key padded":      strings.Replace(base, `"0":"`, `" 0":"`, 1),
+		"pcr key signed":      strings.Replace(base, `"0":"`, `"+0":"`, 1),
+		"pcr key 07":          strings.Replace(base, `"0":"`, `"07":"`, 1),
+		"null digest":         strings.Replace(base, `"`+v1+`"`, `null`, 1),
+		"sha1-size digest":    strings.Replace(base, v1, strings.Repeat("11", 20), 1),
+		"sha384-size digest":  strings.Replace(base, v1, strings.Repeat("11", 48), 1),
+		"null refs pcrs":      strings.Replace(base, `{"0":"`+v1+`"}`, `null`, 1),
+		"refs not array":      strings.Replace(base, `[{"name":"a","pcrs":{"0":"`+v1+`"}}]`, `{"name":"a"}`, 1),
+		"dev roots as string": strings.Replace(base, `"pcrs":[0,7]`, `"pcrs":[0,7],"allow_development_roots":"false"`, 1),
+		"top-level array":     `[` + base + `]`,
+		"top-level null":      `null`,
+		"empty document":      ``,
 	} {
 		if _, err := ParseMeasurement([]byte(doc)); !errors.Is(err, ErrInvalid) {
 			t.Errorf("%s: got %v", name, err)
