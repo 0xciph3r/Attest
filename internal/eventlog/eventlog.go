@@ -313,7 +313,11 @@ func (l *Log) Replay(pcrs map[uint32][]byte) ([]Event, error) {
 		return nil, fmt.Errorf("%w: no PCRs to replay", ErrMalformed)
 	}
 	acc := make(map[uint32][]byte, len(pcrs))
-	for p := range pcrs {
+	for p, v := range pcrs {
+		// A nonexistent PCR would "replay" to its unextended value.
+		if p > maxPCR || len(v) != sha256.Size {
+			return nil, fmt.Errorf("%w: PCR %d with %d-byte value is not a SHA-256 PCR", ErrMalformed, p, len(v))
+		}
 		acc[p] = l.initial(p)
 	}
 	var out []Event

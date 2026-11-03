@@ -374,6 +374,31 @@ func TestNoActionMidLogIgnored(t *testing.T) {
 	}
 }
 
+func TestReplayRejectsBadPCRInputs(t *testing.T) {
+	b := SimulatedBoot("v1")
+	z := make([]byte, 32)
+	for name, pcrs := range map[string]map[uint32][]byte{
+		// PCR 24 does not exist; it must not "replay" to its zero value.
+		"pcr 24":         {24: z},
+		"pcr max":        {0xffffffff: z},
+		"nil value":      {8: nil},
+		"sha1-size":      {8: make([]byte, 20)},
+		"sha384-size":    {8: make([]byte, 48)},
+		"mixed good/bad": {0: b.PCRs(0)[0], 24: z},
+	} {
+		if _, err := ParseAndReplay(b.Bytes(), pcrs); !errors.Is(err, ErrMalformed) {
+			t.Errorf("%s: got %v", name, err)
+		}
+	}
+	// Unused PCRs replay to their reset value; PCR 0 only after StartupLocality.
+	if _, err := ParseAndReplay(b.Bytes(), map[uint32][]byte{8: z, 23: z}); err != nil {
+		t.Fatalf("unextended PCRs: %v", err)
+	}
+	if _, err := ParseAndReplay(b.Bytes(), map[uint32][]byte{8: bytes.Repeat([]byte{0xff}, 32)}); !errors.Is(err, ErrReplay) {
+		t.Fatalf("unextended PCR with nonzero value: %v", err)
+	}
+}
+
 func FuzzParseAndReplay(f *testing.F) {
 	b := SimulatedBoot("v1")
 	f.Add(b.Bytes())
