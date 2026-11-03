@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -306,5 +307,70 @@ func TestForeignKeysOffMigration(t *testing.T) {
 	}
 	if _, err := s.db.ExecContext(ctx, `INSERT INTO c VALUES (2)`); err == nil {
 		t.Fatal("child row without parent accepted after rebuild")
+	}
+}
+
+func TestPathCannotInjectURIParameters(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	for _, name := range []string{
+		"a.db?_pragma=foreign_keys(0)",
+		"b.db?mode=memory",
+		"c.db#frag",
+		"d%3fmode=memory.db",
+		"e.db?_txlock=deferred&_pragma=foreign_keys(0)",
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(dir, name)
+			s, err := Open(ctx, path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var fk int
+			if err := s.db.QueryRowContext(ctx, `PRAGMA foreign_keys`).Scan(&fk); err != nil || fk != 1 {
+				t.Fatalf("foreign_keys=%d err=%v", fk, err)
+			}
+			appendN(t, s, 1)
+			_ = s.Close()
+			// The literal name was used: the data is on disk under it.
+			if _, err := os.Stat(path); err != nil {
+				t.Fatal(err)
+			}
+			ro, err := OpenReadOnly(ctx, path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = ro.Close() }()
+			if h, err := ro.AuditHead(ctx); err != nil || h.Sequence != 1 {
+				t.Fatalf("head=%+v err=%v", h, err)
+			}
+		})
+	}
+
+	// A read-only open cannot be turned into a writable one through the path.
+	s, path := openTemp(t)
+	appendN(t, s, 1)
+	_ = s.Close()
+	rw := path + "?mode=rw"
+	if err := os.Rename(path, rw); err != nil {
+		t.Fatal(err)
+	}
+	ro, err := OpenReadOnly(ctx, rw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ro.Close() }()
+	if _, err := ro.AppendAudit(ctx, audit.Record{Time: time.Now(), Actor: "a", Action: "b", Object: "c"}); err == nil {
+		t.Fatal("read-only store accepted a write")
+	}
+
+	for _, p := range []string{"", ":memory:", "file:x.db", "file::memory:"} {
+		if s, err := Open(ctx, p); err == nil {
+			_ = s.Close()
+			t.Errorf("Open(%q) succeeded", p)
+		}
+		if _, err := OpenReadOnly(ctx, p); err == nil {
+			t.Errorf("OpenReadOnly(%q) succeeded", p)
+		}
 	}
 }

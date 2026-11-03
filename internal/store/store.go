@@ -42,6 +42,9 @@ type Store struct {
 // Open opens (creating if necessary) the database at path and applies any
 // pending migrations.
 func Open(ctx context.Context, path string) (*Store, error) {
+	if err := checkPath(path); err != nil {
+		return nil, err
+	}
 	db, err := sql.Open("sqlite", dsn(path, false))
 	if err != nil {
 		return nil, err
@@ -57,6 +60,9 @@ func Open(ctx context.Context, path string) (*Store, error) {
 // OpenReadOnly opens an existing database without modifying it. It is used by
 // offline verification, which must not alter the evidence it inspects.
 func OpenReadOnly(ctx context.Context, path string) (*Store, error) {
+	if err := checkPath(path); err != nil {
+		return nil, err
+	}
 	db, err := sql.Open("sqlite", dsn(path, true))
 	if err != nil {
 		return nil, err
@@ -72,6 +78,20 @@ func OpenReadOnly(ctx context.Context, path string) (*Store, error) {
 // Close releases the database.
 func (s *Store) Close() error { return s.db.Close() }
 
+// checkPath rejects names SQLite would open as a temporary or in-memory
+// database: the control plane's state must survive a restart.
+func checkPath(path string) error {
+	if path == "" || path == ":memory:" || strings.HasPrefix(path, "file:") {
+		return fmt.Errorf("store: %q is not a database file path", path)
+	}
+	return nil
+}
+
+// uriEscaper escapes the characters that would otherwise end the path in a
+// SQLite URI filename and let it carry its own query parameters, such as
+// "x.db?_pragma=foreign_keys(0)" or "x.db?mode=rw".
+var uriEscaper = strings.NewReplacer("%", "%25", "?", "%3f", "#", "%23")
+
 func dsn(path string, readOnly bool) string {
 	q := url.Values{}
 	q.Add("_pragma", "foreign_keys(1)")
@@ -83,7 +103,7 @@ func dsn(path string, readOnly bool) string {
 		q.Add("_pragma", "synchronous(FULL)")
 		q.Set("_txlock", "immediate")
 	}
-	return "file:" + path + "?" + q.Encode()
+	return "file:" + uriEscaper.Replace(path) + "?" + q.Encode()
 }
 
 type migration struct {
