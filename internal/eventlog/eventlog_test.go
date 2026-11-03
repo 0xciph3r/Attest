@@ -126,20 +126,32 @@ func TestStartupLocality(t *testing.T) {
 
 // rawLog assembles a log with a custom algorithm table.
 func rawLog(algs [][2]uint16, events ...[]byte) []byte {
+	return rawLogSpec([4]byte{0, 2, 0, 2}, algs, nil, events...)
+}
+
+// rawLogSpec assembles a log with custom Spec ID version fields (minor,
+// major, errata, uintnSize), algorithm table and vendor info.
+func rawLogSpec(version [4]byte, algs [][2]uint16, vendor []byte, events ...[]byte) []byte {
 	spec := new(bytes.Buffer)
 	spec.Write(specIDSignature)
 	spec.Write(make([]byte, 4))
-	spec.Write([]byte{0, 2, 0, 2})
+	spec.Write(version[:])
 	_ = binary.Write(spec, binary.LittleEndian, uint32(len(algs)))
 	for _, a := range algs {
 		_ = binary.Write(spec, binary.LittleEndian, a)
 	}
-	spec.WriteByte(0)
+	spec.WriteByte(byte(len(vendor)))
+	spec.Write(vendor)
+	return headerWith(spec.Bytes(), events...)
+}
+
+// headerWith wraps raw Spec ID event data in a header event.
+func headerWith(spec []byte, events ...[]byte) []byte {
 	out := new(bytes.Buffer)
 	_ = binary.Write(out, binary.LittleEndian, [2]uint32{0, EvNoAction})
 	out.Write(make([]byte, 20))
-	_ = binary.Write(out, binary.LittleEndian, uint32(spec.Len()))
-	out.Write(spec.Bytes())
+	_ = binary.Write(out, binary.LittleEndian, uint32(len(spec)))
+	out.Write(spec)
 	for _, e := range events {
 		out.Write(e)
 	}
@@ -192,4 +204,101 @@ func TestOversizedEventData(t *testing.T) {
 	if _, err := Parse(append(b, ev.Bytes()...)); !errors.Is(err, ErrMalformed) {
 		t.Fatalf("got %v", err)
 	}
+}
+
+func TestTruncatedAtEveryOffset(t *testing.T) {
+	b := SimulatedBoot("v1")
+	full, pcrs := b.Bytes(), b.PCRs(bootPCRs...)
+	for n := range len(full) {
+		if _, err := ParseAndReplay(full[:n], pcrs); err == nil {
+			t.Fatalf("log truncated to %d of %d bytes accepted", n, len(full))
+		}
+	}
+}
+
+func TestCorruptedBytesNeverPanic(t *testing.T) {
+	b := SimulatedBoot("v1")
+	full, pcrs := b.Bytes(), b.PCRs(bootPCRs...)
+	for i := range full {
+		for _, v := range []byte{0x00, 0xff, full[i] ^ 0x01} {
+			l := bytes.Clone(full)
+			l[i] = v
+			// Event data is not hashed, so some edits are harmless; any
+			// edit that is accepted must still replay to the same PCRs.
+			_, _ = ParseAndReplay(l, pcrs)
+		}
+	}
+}
+
+func TestEventRejects(t *testing.T) {
+	sha256Only := [][2]uint16{{algSHA256, 32}}
+	pcrs := map[uint32][]byte{0: make([]byte, 32)}
+	ev := func(pcr, count, dataLen uint32, digest []byte) []byte {
+		out := new(bytes.Buffer)
+		_ = binary.Write(out, binary.LittleEndian, [3]uint32{pcr, EvPostCode, count})
+		if digest != nil {
+			_ = binary.Write(out, binary.LittleEndian, algSHA256)
+			out.Write(digest)
+		}
+		_ = binary.Write(out, binary.LittleEndian, dataLen)
+		return out.Bytes()
+	}
+	d := make([]byte, 32)
+	for name, log := range map[string][]byte{
+		"zero digests":         rawLog(sha256Only, ev(0, 0, 0, nil)),
+		"digest count max":     rawLog(sha256Only, ev(0, 0xffffffff, 0, d)),
+		"data length max":      rawLog(sha256Only, ev(0, 1, 0xffffffff, d)),
+		"data length overruns": rawLog(sha256Only, ev(0, 1, 10, d), []byte("short")),
+		"short digest":         rawLog(sha256Only, ev(0, 1, 0, d[:31])),
+		"pcr max":              rawLog(sha256Only, ev(0xffffffff, 1, 0, d)),
+		"pcr 24":               rawLog(sha256Only, ev(24, 1, 0, d)),
+	} {
+		if _, err := ParseAndReplay(log, pcrs); !errors.Is(err, ErrMalformed) {
+			t.Errorf("%s: got %v", name, err)
+		}
+	}
+
+	tooMany := NewBuilder()
+	for range MaxEvents {
+		tooMany.Append(23, EvNoAction, d, nil)
+	}
+	if _, err := Parse(tooMany.Bytes()); err != nil {
+		t.Fatalf("%d events: %v", MaxEvents, err)
+	}
+	tooMany.Append(23, EvNoAction, d, nil)
+	if _, err := Parse(tooMany.Bytes()); !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("%d events: %v", MaxEvents+1, err)
+	}
+}
+
+func TestNoActionMidLogIgnored(t *testing.T) {
+	b := NewBuilder()
+	b.Measure(0, EvPostCode, []byte("a"))
+	// A nonzero digest on EV_NO_ACTION must still not extend.
+	b.Append(0, EvNoAction, bytes.Repeat([]byte{0xaa}, 32), []byte("vendor"))
+	b.Measure(0, EvPostCode, []byte("b"))
+	events, err := ParseAndReplay(b.Bytes(), b.PCRs(0))
+	if err != nil || len(events) != 2 {
+		t.Fatalf("events=%d err=%v", len(events), err)
+	}
+}
+
+func FuzzParseAndReplay(f *testing.F) {
+	b := SimulatedBoot("v1")
+	f.Add(b.Bytes())
+	f.Add(NewBuilder().Bytes())
+	f.Add(rawLog([][2]uint16{{algSHA1, 20}, {algSHA256, 32}}))
+	pcrs := b.PCRs(bootPCRs...)
+	f.Fuzz(func(t *testing.T, raw []byte) {
+		l, err := Parse(raw)
+		if err != nil {
+			return
+		}
+		for _, ev := range l.Events {
+			if ev.PCR > maxPCR || len(ev.Digest) != sha256.Size || ev.Type == EvNoAction {
+				t.Fatalf("parsed invalid event %+v", ev)
+			}
+		}
+		_, _ = l.Replay(pcrs)
+	})
 }
