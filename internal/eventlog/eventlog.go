@@ -183,8 +183,12 @@ func parseHeader(r *reader) (map[uint16]int, error) {
 	}
 	s := &reader{b: data, off: len(specIDSignature)}
 	// platformClass(4) specVersionMinor(1) specVersionMajor(1) specErrata(1) uintnSize(1)
-	if _, err := s.take(8); err != nil {
+	f, err := s.take(8)
+	if err != nil {
 		return nil, err
+	}
+	if minor, major, uintn := f[4], f[5], f[7]; major != 2 || minor != 0 || (uintn != 1 && uintn != 2) {
+		return nil, fmt.Errorf("%w: Spec ID version %d.%d with uintnSize %d (want 2.0 with 1 or 2)", ErrMalformed, major, minor, uintn)
 	}
 	n, err := s.u32()
 	if err != nil {

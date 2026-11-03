@@ -230,6 +230,63 @@ func TestCorruptedBytesNeverPanic(t *testing.T) {
 	}
 }
 
+func TestHeaderRejects(t *testing.T) {
+	sha256Only := [][2]uint16{{algSHA256, 32}}
+	pcrs := map[uint32][]byte{0: make([]byte, 32)}
+	nineAlgs := make([][2]uint16, 9)
+	for i := range nineAlgs {
+		nineAlgs[i] = [2]uint16{uint16(0x100 + i), 32}
+	}
+	nineAlgs[0] = [2]uint16{algSHA256, 32}
+	countOverflow := rawLog(sha256Only)
+	// Patch the algorithm count to 0xffffffff.
+	i := bytes.Index(countOverflow, specIDSignature) + len(specIDSignature) + 8
+	binary.LittleEndian.PutUint32(countOverflow[i:], 0xffffffff)
+
+	for name, log := range map[string][]byte{
+		"spec version 1.0":       rawLogSpec([4]byte{0, 1, 0, 2}, sha256Only, nil),
+		"spec version 2.1":       rawLogSpec([4]byte{1, 2, 0, 2}, sha256Only, nil),
+		"uintnSize 0":            rawLogSpec([4]byte{0, 2, 0, 0}, sha256Only, nil),
+		"uintnSize 3":            rawLogSpec([4]byte{0, 2, 0, 3}, sha256Only, nil),
+		"no algorithms":          rawLog(nil),
+		"nine algorithms":        rawLog(nineAlgs),
+		"algorithm count max":    countOverflow,
+		"duplicate sha256":       rawLog([][2]uint16{{algSHA256, 32}, {algSHA256, 32}}),
+		"sha256 wrong size":      rawLog([][2]uint16{{algSHA256, 20}}),
+		"sha1 wrong size":        rawLog([][2]uint16{{algSHA1, 32}, {algSHA256, 32}}),
+		"zero-size algorithm":    rawLog([][2]uint16{{0x0012, 0}, {algSHA256, 32}}),
+		"oversized algorithm":    rawLog([][2]uint16{{0x0012, 65}, {algSHA256, 32}}),
+		"vendor info overruns":   headerWith(bytes.TrimSuffix(rawLogSpec([4]byte{0, 2, 0, 2}, sha256Only, []byte("abc"))[32:], []byte("c"))),
+		"trailing spec bytes":    headerWith(append(rawLog(sha256Only)[32:], 0)),
+		"spec id event only sig": headerWith(specIDSignature),
+		"header on pcr 1": func() []byte {
+			l := rawLog(sha256Only)
+			l[0] = 1
+			return l
+		}(),
+		"header nonzero sha1": func() []byte {
+			l := rawLog(sha256Only)
+			l[8] = 1
+			return l
+		}(),
+		"header wrong type": func() []byte {
+			l := rawLog(sha256Only)
+			l[4] = 4
+			return l
+		}(),
+	} {
+		if _, err := ParseAndReplay(log, pcrs); !errors.Is(err, ErrMalformed) && !errors.Is(err, ErrNoSHA256) {
+			t.Errorf("%s: got %v", name, err)
+		}
+	}
+	// Both uintn sizes in the specification are accepted.
+	for _, v := range [][4]byte{{0, 2, 0, 1}, {0, 2, 0, 2}, {0, 2, 105, 2}} {
+		if _, err := ParseAndReplay(rawLogSpec(v, sha256Only, []byte("vendor")), pcrs); err != nil {
+			t.Errorf("version %v: %v", v, err)
+		}
+	}
+}
+
 func TestEventRejects(t *testing.T) {
 	sha256Only := [][2]uint16{{algSHA256, 32}}
 	pcrs := map[uint32][]byte{0: make([]byte, 32)}
