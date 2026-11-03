@@ -96,6 +96,9 @@ func dsn(path string, readOnly bool) string {
 	q := url.Values{}
 	q.Add("_pragma", "foreign_keys(1)")
 	q.Add("_pragma", "busy_timeout(5000)")
+	// Make REPLACE conflict resolution fire DELETE triggers, so it cannot
+	// remove rows the triggers protect (see migration 0004).
+	q.Add("_pragma", "recursive_triggers(1)")
 	if readOnly {
 		q.Set("mode", "ro")
 	} else {

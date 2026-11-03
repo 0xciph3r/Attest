@@ -3,7 +3,9 @@ package store
 import (
 	"database/sql"
 	"errors"
+	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -174,4 +176,111 @@ func TestMigration0003PreservesPolicies(t *testing.T) {
 		t.Fatal(err)
 	}
 	rejectedByConstraint(t, s, "policy FK enforced", `INSERT INTO attestations (node_id, challenge_id, verified_at, result, reason, policy_version, evidence_hash, audit_seq) VALUES ('n1', 'c9', 1, 'fail', 'x', 99, zeroblob(32), 1)`)
+}
+
+// dumpTables returns every row of every application table, for checking
+// that rejected writes changed nothing.
+func dumpTables(t *testing.T, db *sql.DB) string {
+	t.Helper()
+	var out strings.Builder
+	for _, table := range []string{"audit_entries", "policies", "nodes", "enrollment_challenges", "attest_challenges", "attestations", "identity_records"} {
+		rows, err := db.Query(`SELECT * FROM ` + table + ` ORDER BY rowid`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cols, _ := rows.Columns()
+		for rows.Next() {
+			vals := make([]any, len(cols))
+			ptrs := make([]any, len(cols))
+			for i := range vals {
+				ptrs[i] = &vals[i]
+			}
+			if err := rows.Scan(ptrs...); err != nil {
+				t.Fatal(err)
+			}
+			fmt.Fprintf(&out, "%s %v\n", table, vals)
+		}
+		_ = rows.Close()
+	}
+	return out.String()
+}
+
+func TestSchemaRefusesReplace(t *testing.T) {
+	s, path := openTemp(t)
+	attID, nextSeq := identityFixture(t, s)
+	now := time.Now()
+	mustUpdate(t, s, func(tx *Tx) error {
+		if err := tx.InsertNode(testNode("n2", 2)); err != nil {
+			return err
+		}
+		if err := tx.InsertEnrollmentChallenge(&EnrollmentChallenge{ID: "e1", NodeID: "n2", AKPublic: []byte{1}, AKName: digest(4),
+			SecretHash: digest(2), IssuedAt: now, ExpiresAt: now.Add(time.Minute)}); err != nil {
+			return err
+		}
+		if err := tx.ConsumeEnrollmentChallenge("e1", now, false); err != nil {
+			return err
+		}
+		if err := tx.ConsumeAttestChallenge("c1", now); err != nil {
+			return err
+		}
+		return tx.InsertIdentity(&Identity{Serial: "00000000000000000000000000000001", Kind: IdentityNode,
+			SPIFFEID: "spiffe://td/attest/node/n1", NodeID: "n1", AttestationID: attID, PublicKeyHash: digest(7),
+			Issuer: "ca1", IssuedAt: now, NotBefore: now, NotAfter: now.Add(time.Hour), AuditSeq: nextSeq(tx)})
+	})
+
+	// Each attack copies a row into a temporary table (which has no
+	// triggers), edits it there and writes it back with REPLACE.
+	replaced := []struct{ name, table, where, set string }{
+		{"un-enroll node", "nodes", "id = 'n1'", "state = 'registered', ak_public = NULL, ak_name = NULL, enrolled_at = NULL"},
+		{"swap node EK", "nodes", "id = 'n2'", "ek_public = x'09'"},
+		{"live node with another's EK", "nodes", "id = 'n2'", "id = 'x'"},
+		{"rewrite policy", "policies", "version = 1", "document = x'00'"},
+		{"flip attestation result", "attestations", "result = 'fail'", "result = 'pass', reason = NULL, policy_version = 1, reference = 'fw', pcr_digest = zeroblob(32)"},
+		{"attestation reusing challenge", "attestations", "result = 'pass'", "id = 99"},
+		{"reset attest challenge", "attest_challenges", "id = 'c1'", "consumed_at = NULL"},
+		{"reset enrollment challenge", "enrollment_challenges", "id = 'e1'", "consumed_at = NULL, outcome = NULL"},
+		{"extend identity", "identity_records", "1", "not_after = not_after + 3600000000000"},
+		{"second node identity", "identity_records", "1", "serial = '0000000000000000000000000000000f', audit_seq = audit_seq"},
+		{"rewrite audit entry", "audit_entries", "seq = 1", "actor = 'mallory'"},
+	}
+	other := []struct{ name, stmt string }{
+		{"upsert node", `INSERT INTO nodes SELECT * FROM nodes WHERE id = 'n1' ON CONFLICT (id) DO UPDATE SET state = 'registered'`},
+		{"update or replace EK", `UPDATE OR REPLACE nodes SET ek_digest = (SELECT ek_digest FROM nodes WHERE id = 'n1') WHERE id = 'n2'`},
+		{"delete attest challenge", `DELETE FROM attest_challenges`},
+		{"delete enrollment challenge", `DELETE FROM enrollment_challenges`},
+	}
+
+	plain, err := sql.Open("sqlite", "file:"+path+"?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = plain.Close() }()
+
+	for conn, db := range map[string]*sql.DB{"attest connection": s.db, "plain connection": plain} {
+		t.Run(conn, func(t *testing.T) {
+			before := dumpTables(t, db)
+			for _, c := range replaced {
+				_, _ = db.Exec(`DROP TABLE IF EXISTS temp.x`)
+				if _, err := db.Exec(`CREATE TEMP TABLE x AS SELECT * FROM main.` + c.table + ` WHERE ` + c.where + ` LIMIT 1`); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := db.Exec(`UPDATE temp.x SET ` + c.set); err != nil {
+					t.Fatalf("%s: %v", c.name, err)
+				}
+				for _, verb := range []string{"REPLACE INTO", "INSERT OR REPLACE INTO"} {
+					if _, err := db.Exec(verb + ` main.` + c.table + ` SELECT * FROM temp.x`); err == nil {
+						t.Errorf("%s via %s: accepted", c.name, verb)
+					}
+				}
+			}
+			for _, c := range other {
+				if _, err := db.Exec(c.stmt); err == nil {
+					t.Errorf("%s: accepted", c.name)
+				}
+			}
+			if after := dumpTables(t, db); after != before {
+				t.Errorf("rejected writes changed the database:\nbefore:\n%s\nafter:\n%s", before, after)
+			}
+		})
+	}
 }
