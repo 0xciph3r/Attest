@@ -1,11 +1,13 @@
 package audit
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"os"
 	"runtime"
 )
@@ -39,16 +41,7 @@ func GenerateKeyFiles(privPath, pubPath string) (ed25519.PublicKey, error) {
 // LoadPrivateKey reads a PEM PKCS#8 Ed25519 private key. On Unix it refuses
 // keys that are readable or writable by group or others.
 func LoadPrivateKey(path string) (ed25519.PrivateKey, error) {
-	if runtime.GOOS != "windows" {
-		fi, err := os.Stat(path)
-		if err != nil {
-			return nil, err
-		}
-		if fi.Mode().Perm()&0o077 != 0 {
-			return nil, fmt.Errorf("audit: private key %s has permissions %v; require 0600 or stricter", path, fi.Mode().Perm())
-		}
-	}
-	der, err := readPEM(path, "PRIVATE KEY")
+	der, err := readPEM(path, "PRIVATE KEY", runtime.GOOS != "windows")
 	if err != nil {
 		return nil, err
 	}
@@ -65,7 +58,7 @@ func LoadPrivateKey(path string) (ed25519.PrivateKey, error) {
 
 // LoadPublicKey reads a PEM PKIX Ed25519 public key.
 func LoadPublicKey(path string) (ed25519.PublicKey, error) {
-	der, err := readPEM(path, "PUBLIC KEY")
+	der, err := readPEM(path, "PUBLIC KEY", false)
 	if err != nil {
 		return nil, err
 	}
@@ -80,19 +73,49 @@ func LoadPublicKey(path string) (ed25519.PublicKey, error) {
 	return pub, nil
 }
 
-func readPEM(path, wantType string) ([]byte, error) {
-	b, err := os.ReadFile(path)
+// maxKeyFileSize bounds a key file; an Ed25519 PEM key is under 200 bytes.
+const maxKeyFileSize = 16 << 10
+
+// readPEM returns the contents of the single PEM block of wantType in path.
+// The block must be canonically encoded (64-column base64, LF line endings,
+// as Attest and openssl write keys) and anything else in the file other
+// than surrounding whitespace is rejected, so a file that is not exactly a
+// key is not mistaken for one. With private
+// set, it checks the permissions of the file it actually opened.
+func readPEM(path, wantType string, private bool) ([]byte, error) {
+	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
-	block, rest := pem.Decode(b)
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("audit: %s is not a regular file", path)
+	}
+	if private && fi.Mode().Perm()&0o077 != 0 {
+		return nil, fmt.Errorf("audit: private key %s has permissions %v; require 0600 or stricter", path, fi.Mode().Perm())
+	}
+	b, err := io.ReadAll(io.LimitReader(f, maxKeyFileSize+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(b) > maxKeyFileSize {
+		return nil, fmt.Errorf("audit: %s is larger than %d bytes", path, maxKeyFileSize)
+	}
+	block, _ := pem.Decode(b)
 	if block == nil || block.Type != wantType {
 		return nil, fmt.Errorf("audit: %s does not contain a PEM %q block", path, wantType)
 	}
-	if len(rest) != 0 {
-		if extra, _ := pem.Decode(rest); extra != nil {
-			return nil, fmt.Errorf("audit: %s contains more than one PEM block", path)
-		}
+	// pem.Decode skips text and malformed blocks around the one it returns.
+	// Requiring the canonical encoding leaves nothing else in the file.
+	if !bytes.Equal(bytes.TrimSpace(b), bytes.TrimSpace(pem.EncodeToMemory(block))) {
+		return nil, fmt.Errorf("audit: %s must contain exactly one canonical PEM %q block and nothing else", path, wantType)
+	}
+	if len(block.Headers) != 0 {
+		return nil, fmt.Errorf("audit: %s has PEM headers (encrypted keys are not supported)", path)
 	}
 	return block.Bytes, nil
 }

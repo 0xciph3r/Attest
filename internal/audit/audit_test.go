@@ -483,6 +483,15 @@ func TestKeyFiles(t *testing.T) {
 	if !p.Equal(gotPub) || !p.Equal(k.Public()) {
 		t.Fatal("loaded keys do not match")
 	}
+	if _, err := GenerateKeyFiles(filepath.Join(dir, "same"), filepath.Join(dir, "same")); err == nil {
+		t.Fatal("private and public key at the same path")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "same")); !os.IsNotExist(err) {
+		t.Fatal("failed generation left a private key behind")
+	}
+	if _, err := GenerateKeyFiles(filepath.Join(dir, "missing", "k"), filepath.Join(dir, "p")); err == nil {
+		t.Fatal("missing directory")
+	}
 	if runtime.GOOS != "windows" {
 		if err := os.Chmod(priv, 0o644); err != nil {
 			t.Fatal(err)
@@ -492,3 +501,72 @@ func TestKeyFiles(t *testing.T) {
 		}
 	}
 }
+
+func TestLoadKeyRejects(t *testing.T) {
+	dir := t.TempDir()
+	privPath, pubPath := filepath.Join(dir, "k"), filepath.Join(dir, "k.pub")
+	if _, err := GenerateKeyFiles(privPath, pubPath); err != nil {
+		t.Fatal(err)
+	}
+	priv, _ := os.ReadFile(privPath)
+	pub, _ := os.ReadFile(pubPath)
+	write := func(data []byte) string {
+		p := filepath.Join(dir, "case")
+		_ = os.Remove(p)
+		if err := os.WriteFile(p, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	cat := func(parts ...[]byte) []byte { return bytes.Join(parts, nil) }
+
+	rsa := []byte("-----BEGIN PUBLIC KEY-----\nMFwwDQYJKoZIhvcNAQEBBQADSwAwSAJBALRiMLAh9iimur8VA7qVvdqxevEuUkW4K+2KdMXmnQbG9Aa7k7eBjK1S+0LYmVjPKlJGNXHDGuy5Fw/d7rjVJ0BLB+ubPK8iA/Tw3hLQgXMRRGRXXCn8ikfuQfjUS1uZSatdLB81mydBETlJhI6GH4twrbDJCR2Bwy/XWXgqgGRcCAwEAAQ==\n-----END PUBLIC KEY-----\n")
+	for name, c := range map[string]struct {
+		data []byte
+		load func(string) error
+	}{
+		"public as private":     {pub, loadPriv},
+		"private as public":     {priv, loadPub},
+		"empty":                 {nil, loadPub},
+		"not pem":               {[]byte("hello"), loadPub},
+		"trailing garbage":      {cat(pub, []byte("garbage")), loadPub},
+		"leading garbage":       {cat([]byte("garbage\n"), pub), loadPub},
+		"two keys":              {cat(pub, pub), loadPub},
+		"malformed block first": {cat([]byte("-----BEGIN PUBLIC KEY-----\n!!\n-----END PUBLIC KEY-----\n"), pub), loadPub},
+		"headers":               {bytes.Replace(pub, []byte("KEY-----\n"), []byte("KEY-----\nProc-Type: 4,ENCRYPTED\n\n"), 1), loadPub},
+		"rsa key":               {rsa, loadPub},
+		"corrupt der":           {bytes.Replace(pub, []byte("MCowBQYDK2Vw"), []byte("MCowBQYDK2Vx"), 1), loadPub},
+		"oversized":             {cat(pub, bytes.Repeat([]byte(" "), maxKeyFileSize)), loadPub},
+	} {
+		if err := c.load(write(c.data)); err == nil {
+			t.Errorf("%s: loaded", name)
+		}
+	}
+	if err := loadPub(write(cat([]byte("\n"), pub, []byte("\n\n")))); err != nil {
+		t.Errorf("surrounding whitespace: %v", err)
+	}
+	if err := loadPub(dir); err == nil {
+		t.Error("directory loaded")
+	}
+	if runtime.GOOS != "windows" {
+		link := filepath.Join(dir, "link")
+		if err := os.Symlink(privPath, link); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(privPath, 0o640); err != nil {
+			t.Fatal(err)
+		}
+		if err := loadPriv(link); err == nil {
+			t.Error("group-readable key loaded through a symlink")
+		}
+		if err := os.Chmod(privPath, 0o400); err != nil {
+			t.Fatal(err)
+		}
+		if err := loadPriv(link); err != nil {
+			t.Errorf("0400 key: %v", err)
+		}
+	}
+}
+
+func loadPriv(p string) error { _, err := LoadPrivateKey(p); return err }
+func loadPub(p string) error  { _, err := LoadPublicKey(p); return err }
