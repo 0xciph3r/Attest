@@ -181,15 +181,17 @@ What it does **not** provide:
 - Entries after the newest checkpoint are only internally consistent; an
   attacker with write access can rewrite or remove them without detection.
 - It does not prove that records were truthful when written (A9).
-- The SQLite triggers that reject UPDATE, DELETE and out-of-order inserts guard
-  against application bugs. They are not a security boundary: anyone who can
-  write the file can drop them.
+- The SQLite triggers that reject UPDATE, DELETE, REPLACE and out-of-order
+  inserts guard against application bugs and injected SQL. They are not a
+  security boundary: anyone who can write the file can drop them.
 
 Failure behavior: verification stops at the first fault and reports the
 sequence number and category (`sequence discontinuity`, `previous-hash
 mismatch`, `entry hash mismatch`, `does not match trusted checkpoint`,
 `truncated`, `invalid checkpoint signature`, `untrusted key`, `checkpoints
-conflict`). `attestctl` exits 1 for verification failures and 2 when the check
+conflict`, `malformed entry` for entries Attest could not have written or
+exports that are not well-formed JSON Lines, and `malformed checkpoint`).
+`attestctl` exits 1 for verification failures and 2 when the check
 could not run.
 
 Tests:

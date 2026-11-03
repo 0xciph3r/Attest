@@ -110,8 +110,9 @@ requires re-enrollment.
                        revoked ◀──────────────────┘
 ```
 
-- Database triggers enforce the transitions, forbid deletion, and make the
-  node ID, EK and enrolled AK immutable.
+- Database triggers enforce the transitions, forbid deletion and replacement
+  (including `INSERT OR REPLACE`), and make the node ID, EK and enrolled AK
+  immutable.
 - There are no transitions out of `revoked`. Re-admitting the same machine
   requires a new registration under a new node ID, which is a new audited
   operator decision.
