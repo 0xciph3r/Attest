@@ -16,6 +16,7 @@ var (
 	ErrTruncated             = errors.New("audit: ledger truncated relative to trusted checkpoint")
 	ErrConflictingCheckpoint = errors.New("audit: trusted checkpoints conflict")
 	ErrUnanchored            = errors.New("audit: no trusted checkpoint supplied")
+	ErrMalformedEntry        = errors.New("audit: malformed entry")
 )
 
 // VerifyError reports where and why verification failed.
@@ -83,6 +84,12 @@ func Verify(entries iter.Seq2[Entry, error], opts VerifyOptions) (Report, error)
 		want := head.Sequence + 1
 		if e.Sequence != want {
 			return Report{}, &VerifyError{Sequence: want, Err: ErrSequence, Detail: fmt.Sprintf("found sequence %d", e.Sequence)}
+		}
+		// An entry Next could not have produced is tampering even if its
+		// hash is consistent: reject it before trusting its encoding.
+		rec := Record{Time: e.Time, Actor: e.Actor, Action: e.Action, Object: e.Object, Metadata: e.Metadata}
+		if err := rec.validate(); err != nil {
+			return Report{}, &VerifyError{Sequence: e.Sequence, Err: ErrMalformedEntry, Detail: err.Error()}
 		}
 		if e.PrevHash != head.Hash {
 			return Report{}, &VerifyError{Sequence: e.Sequence, Err: ErrPrevHash}

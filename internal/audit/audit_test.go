@@ -5,9 +5,11 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -112,6 +114,18 @@ func TestVerifyDetectsTampering(t *testing.T) {
 		{"truncated before checkpoint", func(e []Entry) []Entry { return e[:5] }, ErrTruncated},
 		{"emptied ledger", func(e []Entry) []Entry { return nil }, ErrTruncated},
 		{"missing genesis entry", func(e []Entry) []Entry { return e[1:] }, ErrSequence},
+		{"altered prev hash only", func(e []Entry) []Entry { e[2].PrevHash[0] ^= 1; return e }, ErrPrevHash},
+		{"altered hash only", func(e []Entry) []Entry { e[2].Hash[31] ^= 1; return e }, ErrEntryHash},
+		{"zero sequence", func(e []Entry) []Entry { e[0].Sequence = 0; return e }, ErrSequence},
+		{"altered after checkpoint", func(e []Entry) []Entry { e[8].Object = "node/evil"; return e }, ErrEntryHash},
+		{"appended copy of head", func(e []Entry) []Entry { return append(e, e[9]) }, ErrSequence},
+		{"appended entry not chained", func(e []Entry) []Entry {
+			x := e[9]
+			x.Sequence = 11
+			x.PrevHash = e[8].Hash
+			x.Hash = x.chainHash(x.PrevHash)
+			return append(e, x)
+		}, ErrPrevHash},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -212,6 +226,11 @@ func TestNextValidation(t *testing.T) {
 		"empty action":   func(r *Record) { r.Action = "" },
 		"empty object":   func(r *Record) { r.Object = "" },
 		"large metadata": func(r *Record) { r.Metadata = make([]byte, MaxMetadataSize+1) },
+		"long actor":     func(r *Record) { r.Actor = strings.Repeat("a", MaxFieldSize+1) },
+		"long object":    func(r *Record) { r.Object = strings.Repeat("o", MaxFieldSize+1) },
+		"invalid utf-8":  func(r *Record) { r.Actor = "operator:\xff" },
+		"after 2262":     func(r *Record) { r.Time = time.Date(2263, 1, 1, 0, 0, 0, 0, time.UTC) },
+		"before 1678":    func(r *Record) { r.Time = time.Date(1677, 1, 1, 0, 0, 0, 0, time.UTC) },
 	} {
 		r := valid
 		mutate(&r)
@@ -221,6 +240,80 @@ func TestNextValidation(t *testing.T) {
 	}
 	if _, err := Next(Head{Hash: Hash{1}}, valid); !errors.Is(err, ErrInvalidRecord) {
 		t.Errorf("non-genesis empty head: got %v", err)
+	}
+	if _, err := Next(Head{Sequence: math.MaxUint64, Hash: Hash{1}}, valid); !errors.Is(err, ErrInvalidRecord) {
+		t.Errorf("exhausted sequence: got %v", err)
+	}
+	edge := valid
+	edge.Actor = strings.Repeat("a", MaxFieldSize)
+	edge.Metadata = make([]byte, MaxMetadataSize)
+	if _, err := Next(Head{}, edge); err != nil {
+		t.Errorf("maximum sizes: %v", err)
+	}
+}
+
+// aliasTime returns a time 2^64 nanoseconds after t: a different instant
+// with the same wrapped UnixNano encoding.
+func aliasTime(t time.Time) time.Time {
+	const s, ns = 18446744073, 709551616 // 2^64 ns
+	return time.Unix(t.Unix()+s, int64(t.Nanosecond())+ns).UTC()
+}
+
+func TestVerifyRejectsMalformedEntries(t *testing.T) {
+	key := newKey(t)
+	for name, mutate := range map[string]func(*Entry){
+		// The hash would not change, so without a range check this edit
+		// would pass even a checkpointed verification.
+		"time aliased past 2262": func(e *Entry) { e.Time = aliasTime(e.Time) },
+		"zero time":              func(e *Entry) { e.Time = time.Time{} },
+		"empty actor":            func(e *Entry) { e.Actor = "" },
+		"invalid utf-8":          func(e *Entry) { e.Object = "node/\xc3" },
+		"oversized metadata":     func(e *Entry) { e.Metadata = make([]byte, MaxMetadataSize+1) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			entries := buildChain(t, 3)
+			cp := checkpointAt(t, entries, 3, key)
+			before := entries[1].Hash
+			mutate(&entries[1])
+			// Rehash the suffix as a database writer would.
+			prev := entries[0].Hash
+			for i := 1; i < len(entries); i++ {
+				entries[i].PrevHash = prev
+				entries[i].Hash = entries[i].chainHash(prev)
+				prev = entries[i].Hash
+			}
+			if name == "time aliased past 2262" && entries[1].Hash != before {
+				t.Fatal("alias did not collide; test is not exercising the wrap")
+			}
+			_, err := Verify(Slice(entries), opts(key, cp))
+			if !errors.Is(err, ErrMalformedEntry) {
+				t.Fatalf("got %v", err)
+			}
+		})
+	}
+}
+
+func TestParseHash(t *testing.T) {
+	good := strings.Repeat("ab", HashSize)
+	if _, err := ParseHash(good); err != nil {
+		t.Fatal(err)
+	}
+	for name, s := range map[string]string{
+		"uppercase":  strings.ToUpper(good),
+		"mixed case": "A" + good[1:],
+		"short":      good[:63],
+		"long":       good + "0",
+		"odd digit":  good[:63] + "g",
+		"whitespace": " " + good[1:],
+		"0x prefix":  "0x" + good[2:],
+		"empty":      "",
+	} {
+		if _, err := ParseHash(s); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	if _, err := HashFromBytes(make([]byte, 31)); err == nil {
+		t.Error("31-byte hash accepted")
 	}
 }
 
