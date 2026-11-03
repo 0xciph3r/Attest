@@ -128,3 +128,97 @@ func TestReadEKCertRejectsMisbehavingTPM(t *testing.T) {
 		t.Fatal("missing NV index accepted")
 	}
 }
+
+// pcrRead serves PCR_Read, letting tweak alter the selection and digests.
+func (f *fakeTPM) pcrRead(tweak func(sel *tpm2.TPMLPCRSelection, d *tpm2.TPMLDigest)) {
+	f.handlers[tpm2.TPMCCPCRRead] = func(cmd []byte) ([]byte, bool) {
+		var sel tpm2.TPMLPCRSelection
+		s, err := tpm2.Unmarshal[tpm2.TPMLPCRSelection](cmd[10:])
+		if err == nil {
+			sel = *s
+		}
+		var d tpm2.TPMLDigest
+		for _, ps := range sel.PCRSelections {
+			for i, b := range ps.PCRSelect {
+				for bit := range 8 {
+					if b&(1<<bit) != 0 {
+						d.Digests = append(d.Digests, tpm2.TPM2BDigest{Buffer: bytes.Repeat([]byte{byte(i*8 + bit)}, 32)})
+					}
+				}
+			}
+		}
+		if tweak != nil {
+			tweak(&sel, &d)
+		}
+		return cat([]byte{0, 0, 0, 1}, tpm2.Marshal(sel), tpm2.Marshal(d)), false
+	}
+}
+
+func TestReadPCRsFake(t *testing.T) {
+	f := newFake()
+	f.pcrRead(nil)
+	got, err := ReadPCRs(f, []uint32{23, 0, 9, 1, 2, 3, 4, 5, 6, 7})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for p, v := range got {
+		if !bytes.Equal(v, bytes.Repeat([]byte{byte(p)}, 32)) {
+			t.Fatalf("PCR %d = %x", p, v)
+		}
+	}
+	if f.calls[tpm2.TPMCCPCRRead] != 2 {
+		t.Fatalf("%d PCR_Read calls for 10 PCRs, want 2", f.calls[tpm2.TPMCCPCRRead])
+	}
+}
+
+func TestReadPCRsRejectsMisbehavingTPM(t *testing.T) {
+	for name, tweak := range map[string]func(*tpm2.TPMLPCRSelection, *tpm2.TPMLDigest){
+		"dropped digest": func(_ *tpm2.TPMLPCRSelection, d *tpm2.TPMLDigest) { d.Digests = d.Digests[1:] },
+		"extra digest": func(_ *tpm2.TPMLPCRSelection, d *tpm2.TPMLDigest) {
+			d.Digests = append(d.Digests, d.Digests[0])
+		},
+		"short digest":    func(_ *tpm2.TPMLPCRSelection, d *tpm2.TPMLDigest) { d.Digests[0].Buffer = d.Digests[0].Buffer[:20] },
+		"long digest":     func(_ *tpm2.TPMLPCRSelection, d *tpm2.TPMLDigest) { d.Digests[0].Buffer = make([]byte, 48) },
+		"empty digest":    func(_ *tpm2.TPMLPCRSelection, d *tpm2.TPMLDigest) { d.Digests[0].Buffer = nil },
+		"sha1 bank":       func(s *tpm2.TPMLPCRSelection, _ *tpm2.TPMLDigest) { s.PCRSelections[0].Hash = tpm2.TPMAlgSHA1 },
+		"other selection": func(s *tpm2.TPMLPCRSelection, _ *tpm2.TPMLDigest) { s.PCRSelections[0].PCRSelect[0] ^= 0x80 },
+		"two banks": func(s *tpm2.TPMLPCRSelection, _ *tpm2.TPMLDigest) {
+			s.PCRSelections = append(s.PCRSelections, s.PCRSelections[0])
+		},
+		"no selection": func(s *tpm2.TPMLPCRSelection, d *tpm2.TPMLDigest) { s.PCRSelections, d.Digests = nil, nil },
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newFake()
+			f.pcrRead(tweak)
+			if _, err := ReadPCRs(f, []uint32{0, 1, 7}); err == nil {
+				t.Fatal("accepted")
+			}
+		})
+	}
+	for name, pcrs := range map[string][]uint32{
+		"pcr 24":    {24},
+		"pcr max":   {0xffffffff},
+		"duplicate": {7, 0, 7},
+	} {
+		if _, err := ReadPCRs(newFake(), pcrs); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}
+
+func TestMakeQuoteRejectsBadSelection(t *testing.T) {
+	ak := &Key{Handle: 0x80000000}
+	for name, pcrs := range map[string][]uint32{
+		"empty":     nil,
+		"pcr 24":    {24},
+		"duplicate": {1, 1},
+	} {
+		f := newFake()
+		if _, err := MakeQuote(f, ak, make([]byte, 32), pcrs); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+		if len(f.calls) != 0 {
+			t.Errorf("%s: sent commands to the TPM before validating input", name)
+		}
+	}
+}

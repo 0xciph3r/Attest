@@ -87,12 +87,17 @@ func ReadPCRs(t transport.TPM, pcrs []uint32) (map[uint32][]byte, error) {
 			return nil, fmt.Errorf("tpm: PCR read: %w", err)
 		}
 		if len(rsp.PCRSelectionOut.PCRSelections) != 1 ||
+			rsp.PCRSelectionOut.PCRSelections[0].Hash != tpm2.TPMAlgSHA256 ||
 			!bytes.Equal(rsp.PCRSelectionOut.PCRSelections[0].PCRSelect, sel.PCRSelections[0].PCRSelect) ||
 			len(rsp.PCRValues.Digests) != len(chunk) {
 			return nil, errors.New("tpm: PCR read returned a different selection")
 		}
 		for i, p := range chunk {
-			out[p] = rsp.PCRValues.Digests[i].Buffer
+			d := rsp.PCRValues.Digests[i].Buffer
+			if len(d) != sha256.Size {
+				return nil, fmt.Errorf("tpm: PCR %d read returned a %d-byte SHA-256 value", p, len(d))
+			}
+			out[p] = d
 		}
 	}
 	return out, nil
