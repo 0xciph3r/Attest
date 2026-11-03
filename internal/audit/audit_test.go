@@ -293,6 +293,56 @@ func TestVerifyRejectsMalformedEntries(t *testing.T) {
 	}
 }
 
+func TestCheckpointKeyMisuse(t *testing.T) {
+	entries := buildChain(t, 2)
+	key := newKey(t)
+	head := Head{Sequence: 2, Hash: entries[1].Hash}
+
+	mismatched := append(ed25519.PrivateKey(nil), key...)
+	copy(mismatched[32:], newKey(t)[32:])
+	for name, k := range map[string]ed25519.PrivateKey{
+		"nil":               nil,
+		"seed only":         key.Seed(),
+		"truncated":         key[:63],
+		"mismatched halves": mismatched,
+	} {
+		if _, err := SignCheckpoint(head, t0, k); err == nil {
+			t.Errorf("%s: signed", name)
+		}
+	}
+	if _, err := SignCheckpoint(head, time.Date(2263, 1, 1, 0, 0, 0, 0, time.UTC), key); err == nil {
+		t.Error("signed an unencodable time")
+	}
+
+	cp := checkpointAt(t, entries, 2, key)
+	for name, ring := range map[string]KeyRing{
+		"short key": {cp.KeyID: key.Public().(ed25519.PublicKey)[:31]},
+		"nil key":   {cp.KeyID: nil},
+		"empty":     {},
+		"nil ring":  nil,
+	} {
+		if err := cp.Verify(ring); err == nil {
+			t.Errorf("%s: verified", name)
+		}
+	}
+	for name, mutate := range map[string]func(*SignedCheckpoint){
+		"no signature":    func(c *SignedCheckpoint) { c.Signature = nil },
+		"short signature": func(c *SignedCheckpoint) { c.Signature = c.Signature[:63] },
+		"long signature":  func(c *SignedCheckpoint) { c.Signature = append(c.Signature, 0) },
+		"zero sequence":   func(c *SignedCheckpoint) { c.Sequence = 0 },
+		"time aliased":    func(c *SignedCheckpoint) { c.Time = aliasTime(c.Time) },
+		"key id case":     func(c *SignedCheckpoint) { c.KeyID = strings.ToUpper(c.KeyID) },
+		"flipped sig bit": func(c *SignedCheckpoint) { c.Signature[0] ^= 1 },
+	} {
+		c := checkpointAt(t, entries, 2, key)
+		c.Signature = append([]byte(nil), c.Signature...)
+		mutate(&c)
+		if err := c.Verify(NewKeyRing(key.Public().(ed25519.PublicKey))); err == nil {
+			t.Errorf("%s: verified", name)
+		}
+	}
+}
+
 func TestParseHash(t *testing.T) {
 	good := strings.Repeat("ab", HashSize)
 	if _, err := ParseHash(good); err != nil {

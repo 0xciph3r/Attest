@@ -76,9 +76,18 @@ func SignCheckpoint(head Head, at time.Time, key ed25519.PrivateKey) (SignedChec
 	if head.Sequence == 0 {
 		return SignedCheckpoint{}, errors.New("audit: cannot checkpoint an empty ledger")
 	}
-	pub, ok := key.Public().(ed25519.PublicKey)
-	if !ok {
-		return SignedCheckpoint{}, errors.New("audit: signing key is not Ed25519")
+	if !encodableTime(at) {
+		return SignedCheckpoint{}, fmt.Errorf("audit: checkpoint time %s is outside the encodable range", at)
+	}
+	// ed25519 panics on a wrongly sized key, and signs with whatever public
+	// half the key carries; a key whose halves disagree would produce
+	// checkpoints that never verify under the key ID they name.
+	if len(key) != ed25519.PrivateKeySize {
+		return SignedCheckpoint{}, fmt.Errorf("audit: signing key is %d bytes, want %d", len(key), ed25519.PrivateKeySize)
+	}
+	pub := ed25519.NewKeyFromSeed(key.Seed()).Public().(ed25519.PublicKey)
+	if !pub.Equal(key.Public()) {
+		return SignedCheckpoint{}, errors.New("audit: signing key's public half does not match its seed")
 	}
 	c := Checkpoint{
 		Sequence: head.Sequence,
@@ -95,8 +104,14 @@ func (s *SignedCheckpoint) Verify(keys KeyRing) error {
 	if !ok {
 		return fmt.Errorf("%w: %q", ErrUnknownKey, s.KeyID)
 	}
+	if len(pub) != ed25519.PublicKeySize {
+		return fmt.Errorf("%w: trusted key %q is %d bytes", ErrUnknownKey, s.KeyID, len(pub))
+	}
 	if s.Sequence == 0 {
 		return fmt.Errorf("%w: sequence 0", ErrCheckpointSignature)
+	}
+	if !encodableTime(s.Time) {
+		return fmt.Errorf("%w: time %s is outside the encodable range", ErrCheckpointSignature, s.Time)
 	}
 	if !ed25519.Verify(pub, s.signedBytes(), s.Signature) {
 		return fmt.Errorf("%w: checkpoint at sequence %d", ErrCheckpointSignature, s.Sequence)
