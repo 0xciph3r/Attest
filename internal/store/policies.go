@@ -9,8 +9,14 @@ import (
 // PolicyKind names a policy document type.
 type PolicyKind string
 
-// PolicyMeasurement is the measured-boot reference policy.
-const PolicyMeasurement PolicyKind = "measurement"
+// Policy kinds.
+const (
+	// PolicyMeasurement is the measured-boot reference policy.
+	PolicyMeasurement PolicyKind = "measurement"
+	// PolicyWorkload maps workloads to the nodes and local boundaries
+	// they may be identified on.
+	PolicyWorkload PolicyKind = "workload"
+)
 
 // Policy is a stored policy version.
 type Policy struct {
