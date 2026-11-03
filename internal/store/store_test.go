@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -266,5 +267,44 @@ func TestReadOnlyOpenCannotWrite(t *testing.T) {
 	}
 	if _, err := OpenReadOnly(ctx, filepath.Join(t.TempDir(), "missing.db")); err == nil {
 		t.Fatal("read-only open of a missing database must fail")
+	}
+}
+
+func TestForeignKeysOffMigration(t *testing.T) {
+	ctx := context.Background()
+	s, _ := openTemp(t)
+	s.db.SetMaxOpenConns(1) // observe the connection the migration used
+	enforced := func() bool {
+		var on int
+		if err := s.db.QueryRowContext(ctx, `PRAGMA foreign_keys`).Scan(&on); err != nil {
+			t.Fatal(err)
+		}
+		return on == 1
+	}
+	setup := `CREATE TABLE p (id INTEGER PRIMARY KEY); CREATE TABLE c (p INTEGER REFERENCES p (id));
+		INSERT INTO p VALUES (1); INSERT INTO c VALUES (1);`
+	if _, err := s.db.ExecContext(ctx, setup); err != nil {
+		t.Fatal(err)
+	}
+
+	dangling := migration{version: 100, name: "dangling", sql: foreignKeysOff + `DROP TABLE p;`}
+	if err := s.apply(ctx, dangling); err == nil || !strings.Contains(err.Error(), "foreign key check failed") {
+		t.Fatalf("dangling reference: got %v", err)
+	}
+	if !enforced() {
+		t.Fatal("foreign keys left disabled after failed migration")
+	}
+
+	rebuild := migration{version: 100, name: "rebuild", sql: foreignKeysOff + `
+		CREATE TABLE p_new (id INTEGER PRIMARY KEY CHECK (id > 0));
+		INSERT INTO p_new SELECT id FROM p; DROP TABLE p; ALTER TABLE p_new RENAME TO p;`}
+	if err := s.apply(ctx, rebuild); err != nil {
+		t.Fatal(err)
+	}
+	if !enforced() {
+		t.Fatal("foreign keys left disabled after migration")
+	}
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO c VALUES (2)`); err == nil {
+		t.Fatal("child row without parent accepted after rebuild")
 	}
 }

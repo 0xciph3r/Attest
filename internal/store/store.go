@@ -8,6 +8,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"embed"
 	"errors"
 	"fmt"
@@ -149,14 +150,49 @@ func (s *Store) migrate(ctx context.Context) error {
 	return nil
 }
 
+// foreignKeysOff marks a migration that rebuilds a table referenced by
+// foreign keys. SQLite cannot change a table's constraints in place, and
+// dropping a parent table with enforcement on would fail, so such
+// migrations follow SQLite's documented procedure: disable enforcement on a
+// dedicated connection, rebuild inside a transaction, and require
+// PRAGMA foreign_key_check to pass before committing.
+const foreignKeysOff = "-- attest:foreign-keys-off\n"
+
 func (s *Store) apply(ctx context.Context, m migration) error {
-	tx, err := s.db.BeginTx(ctx, nil)
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close() }()
+	if strings.HasPrefix(m.sql, foreignKeysOff) {
+		if _, err := conn.ExecContext(ctx, `PRAGMA foreign_keys = OFF`); err != nil {
+			return fmt.Errorf("store: apply %s: %w", m.name, err)
+		}
+		defer func() {
+			// Never return a connection without enforcement to the pool.
+			if _, err := conn.ExecContext(context.Background(), `PRAGMA foreign_keys = ON`); err != nil {
+				_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+			}
+		}()
+	}
+	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
 	if _, err := tx.ExecContext(ctx, m.sql); err != nil {
 		return fmt.Errorf("store: apply %s: %w", m.name, err)
+	}
+	rows, err := tx.QueryContext(ctx, `PRAGMA foreign_key_check`)
+	if err != nil {
+		return fmt.Errorf("store: apply %s: %w", m.name, err)
+	}
+	violation := rows.Next()
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return fmt.Errorf("store: apply %s: %w", m.name, err)
+	}
+	if violation {
+		return fmt.Errorf("store: apply %s: foreign key check failed", m.name)
 	}
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)`,
