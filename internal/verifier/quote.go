@@ -5,6 +5,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/sha256"
 	"crypto/subtle"
+	"errors"
 	"maps"
 	"math/big"
 	"slices"
@@ -44,6 +45,16 @@ type QuoteInfo struct {
 // the claimed PCR values hash to the signed digest. Nothing from the attest
 // structure is trusted before the signature check.
 func VerifyQuote(ak *AK, nonce []byte, required []uint32, ev *Evidence) (*QuoteInfo, error) {
+	if ak == nil || ak.Key == nil {
+		return nil, errors.New("verifier: no attestation key")
+	}
+	if ev == nil {
+		return nil, fail(ReasonMalformed, "no evidence")
+	}
+	// An empty selection signs only SHA-256(""), which attests nothing.
+	if len(required) == 0 {
+		return nil, fail(ReasonPCRSelection, "no PCRs required")
+	}
 	if len(ev.Attest) == 0 || len(ev.Attest) > MaxAttestSize ||
 		len(ev.Signature) == 0 || len(ev.Signature) > MaxSignatureSize {
 		return nil, fail(ReasonMalformed, "quote or signature size out of range")

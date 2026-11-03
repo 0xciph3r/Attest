@@ -165,6 +165,45 @@ func TestHighSSignatureIsSameQuote(t *testing.T) {
 	}
 }
 
+func TestVerifyRejectsMissingInputs(t *testing.T) {
+	f := newFixture(t)
+	bad := map[string]func() error{
+		"nil AK": func() error { _, err := VerifyEvidence(nil, f.nonce, f.policy, f.ev); return err },
+		"AK without key": func() error {
+			_, err := VerifyEvidence(&AK{}, f.nonce, f.policy, f.ev)
+			return err
+		},
+		"nil evidence": func() error { _, err := VerifyEvidence(f.ak.ak, f.nonce, f.policy, nil); return err },
+		"empty selection": func() error {
+			_, err := VerifyQuote(f.ak.ak, f.nonce, nil, &Evidence{Attest: f.ev.Attest, Signature: f.ev.Signature})
+			return err
+		},
+	}
+	for name, call := range bad {
+		t.Run(name, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("panic: %v", r)
+				}
+			}()
+			if err := call(); err == nil {
+				t.Fatal("accepted")
+			}
+		})
+	}
+}
+
+// A quote over an empty selection signs SHA-256("") as the PCR digest; it
+// must not verify against an empty requirement.
+func TestEmptySelectionQuote(t *testing.T) {
+	f := newFixture(t)
+	a := f.ak.attest(f.nonce, map[uint32][]byte{})
+	f.resign(t, a)
+	if _, err := VerifyQuote(f.ak.ak, f.nonce, []uint32{}, &Evidence{Attest: f.ev.Attest, Signature: f.ev.Signature}); err == nil {
+		t.Fatal("empty-selection quote accepted")
+	}
+}
+
 // The result must not alias caller-owned evidence.
 func TestQuoteInfoDoesNotAliasEvidence(t *testing.T) {
 	f := newFixture(t)
