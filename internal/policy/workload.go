@@ -144,8 +144,12 @@ func (p *WorkloadPolicy) validate() error {
 }
 
 // Match returns the workload the caller is authorized as. Node, service and
-// UID must all match one rule.
+// UID must all match one rule. Only policies returned by ParseWorkload
+// identify anything.
 func (p *WorkloadPolicy) Match(c Caller) (*Workload, error) {
+	if p == nil || p.digest == nil {
+		return nil, ErrWorkloadNotAllowed
+	}
 	for i := range p.Workloads {
 		w := &p.Workloads[i]
 		if w.SystemdUnit == c.SystemdUnit && *w.UID == c.UID && slices.Contains(w.Nodes, c.NodeID) {

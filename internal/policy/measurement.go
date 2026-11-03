@@ -145,7 +145,11 @@ func (m *Measurement) Digest() []byte { return bytes.Clone(m.digest) }
 
 // Evaluate returns the name of the first reference satisfied by pcrs,
 // which must be authenticated values covering the policy's selection.
+// Only policies returned by ParseMeasurement admit anything.
 func (m *Measurement) Evaluate(pcrs map[uint32][]byte) (string, error) {
+	if m == nil || m.digest == nil {
+		return "", fmt.Errorf("%w: policy was not parsed", ErrMeasurementNotAllowed)
+	}
 	if !slices.Equal(slices.Sorted(maps.Keys(pcrs)), m.PCRs) {
 		return "", fmt.Errorf("%w: PCR set differs from policy selection", ErrMeasurementNotAllowed)
 	}
