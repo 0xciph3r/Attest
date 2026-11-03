@@ -21,8 +21,11 @@ const (
 // ErrWorkloadNotAllowed is returned when no workload rule matches a caller.
 var ErrWorkloadNotAllowed = errors.New("policy: no workload matches the caller")
 
+// NodeIDPattern is the syntax of node identifiers.
+const NodeIDPattern = `^[a-z0-9][a-z0-9.-]{0,62}$`
+
 var (
-	nodeIDRe       = regexp.MustCompile(`^[a-z0-9][a-z0-9.-]{0,62}$`)
+	nodeIDRe       = regexp.MustCompile(NodeIDPattern)
 	workloadNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
 	// systemd unit names: letters, digits and ":-_.\@", at most 255 bytes.
 	systemdServiceRe = regexp.MustCompile(`^[A-Za-z0-9:_.\\@-]{1,247}\.service$`)

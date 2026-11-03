@@ -41,7 +41,6 @@ var ErrInvalidRequest = errors.New("verifier: invalid request")
 
 var (
 	challengeIDRe = regexp.MustCompile(`^att_[0-9a-f]{32}$`)
-	nodeIDRe      = regexp.MustCompile(`^[a-z0-9][a-z0-9.-]{0,62}$`)
 )
 
 // ServiceConfig configures a Service.
@@ -117,7 +116,7 @@ type Challenge struct {
 // Challenge issues a single-use nonce to an enrolled node. Only the nonce's
 // hash is stored.
 func (s *Service) Challenge(ctx context.Context, nodeID string) (*Challenge, error) {
-	if !nodeIDRe.MatchString(nodeID) {
+	if !policy.ValidNodeID(nodeID) {
 		return nil, ErrInvalidRequest
 	}
 	now := s.now()
@@ -173,7 +172,7 @@ type Verdict struct {
 // recorded and the attempt is refused. Attempts against unknown or consumed
 // challenges are audited only.
 func (s *Service) Verify(ctx context.Context, nodeID, challengeID string, nonce []byte, ev *Evidence) (*Verdict, error) {
-	if !challengeIDRe.MatchString(challengeID) || !nodeIDRe.MatchString(nodeID) || ev == nil {
+	if !challengeIDRe.MatchString(challengeID) || !policy.ValidNodeID(nodeID) || ev == nil {
 		return nil, ErrInvalidRequest
 	}
 	now := s.now()

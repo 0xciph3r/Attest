@@ -21,6 +21,7 @@ import (
 	"github.com/google/go-tpm/tpm2"
 
 	"github.com/0xciph3r/attest/internal/audit"
+	"github.com/0xciph3r/attest/internal/policy"
 	"github.com/0xciph3r/attest/internal/store"
 	"github.com/0xciph3r/attest/internal/verifier"
 )
@@ -45,11 +46,7 @@ const (
 )
 
 // ErrInvalidNodeID is returned for node IDs outside the allowed syntax.
-var ErrInvalidNodeID = errors.New("enrollment: node ID must match " + nodeIDPattern)
-
-const nodeIDPattern = `^[a-z0-9][a-z0-9.-]{0,62}$`
-
-var nodeIDRe = regexp.MustCompile(nodeIDPattern)
+var ErrInvalidNodeID = errors.New("enrollment: node ID must match " + policy.NodeIDPattern)
 
 // ErrInvalidChallengeID is returned for malformed challenge IDs.
 var ErrInvalidChallengeID = errors.New("enrollment: malformed challenge ID")
@@ -100,7 +97,7 @@ func New(cfg Config) (*Service, error) {
 // development root is accepted only if the current measurement policy allows
 // it. Registration is the only way a node record comes into existence.
 func (s *Service) Register(ctx context.Context, actor, nodeID string, ekCert []byte) (*store.Node, error) {
-	if !nodeIDRe.MatchString(nodeID) {
+	if !policy.ValidNodeID(nodeID) {
 		return nil, ErrInvalidNodeID
 	}
 	if len(ekCert) > MaxEKCertSize {
@@ -154,7 +151,7 @@ type Challenge struct {
 // the AK name computed here, so only the approved TPM holding that AK can
 // recover it. Nothing the node supplies about its EK is trusted.
 func (s *Service) Begin(ctx context.Context, nodeID string, akPublic []byte) (*Challenge, error) {
-	if !nodeIDRe.MatchString(nodeID) {
+	if !policy.ValidNodeID(nodeID) {
 		return nil, ErrInvalidNodeID
 	}
 	now := s.now()
@@ -231,7 +228,7 @@ func (s *Service) begin(tx *store.Tx, now time.Time, nodeID string, akPublic []b
 // challenge admits exactly one attempt: it is consumed whatever the outcome,
 // and the outcome is audited in the same transaction.
 func (s *Service) Complete(ctx context.Context, nodeID, challengeID string, secret []byte) error {
-	if !nodeIDRe.MatchString(nodeID) {
+	if !policy.ValidNodeID(nodeID) {
 		return ErrInvalidNodeID
 	}
 	if !challengeIDRe.MatchString(challengeID) {
