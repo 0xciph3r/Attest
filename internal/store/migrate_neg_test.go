@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
@@ -70,6 +72,41 @@ func TestConcurrentOpenOfFreshDatabase(t *testing.T) {
 
 // The recorded history must be exactly this binary's migrations; a gap or a
 // differently named migration means the schema did not come from this code.
+func TestDivergentHistoryRefused(t *testing.T) {
+	ctx := context.Background()
+	for name, tamper := range map[string]string{
+		"gap":      `DELETE FROM schema_migrations WHERE version = 2`,
+		"renamed":  `UPDATE schema_migrations SET name = '0002_other.sql' WHERE version = 2`,
+		"version0": `INSERT INTO schema_migrations VALUES (0, 'zero', 0)`,
+		"negative": `INSERT INTO schema_migrations VALUES (-1, 'neg', 0)`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			s, path := openTemp(t)
+			_ = s.Close()
+			db, err := sql.Open("sqlite", dsn(path, false))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Exec(tamper); err != nil {
+				t.Fatal(err)
+			}
+			_ = db.Close()
+			if s, err := Open(ctx, path); !errors.Is(err, ErrSchemaHistory) {
+				if s != nil {
+					_ = s.Close()
+				}
+				t.Fatalf("Open: got %v", err)
+			}
+			if s, err := OpenReadOnly(ctx, path); !errors.Is(err, ErrSchemaHistory) {
+				if s != nil {
+					_ = s.Close()
+				}
+				t.Fatalf("OpenReadOnly: got %v", err)
+			}
+		})
+	}
+}
+
 func TestOpenRejectsNonDatabases(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()

@@ -35,6 +35,11 @@ var ErrSchemaTooNew = errors.New("store: database schema is newer than this bina
 // migrations.
 var ErrSchemaOutdated = errors.New("store: database schema is older than this binary expects")
 
+// ErrSchemaHistory is returned when the recorded migrations are not a
+// contiguous prefix of this binary's migrations, so the schema did not come
+// from this code.
+var ErrSchemaHistory = errors.New("store: database migration history does not match this binary")
+
 // Store is a handle to the control-plane database.
 type Store struct {
 	db *sql.DB
@@ -194,12 +199,9 @@ func (s *Store) migrate(ctx context.Context) error {
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("store: create schema_migrations: %w", err)
 	}
-	current, err := s.schemaVersion(ctx)
+	current, err := schemaHistory(ctx, s.db, ms)
 	if err != nil {
 		return err
-	}
-	if current > len(ms) {
-		return fmt.Errorf("%w (database %d, binary %d)", ErrSchemaTooNew, current, len(ms))
 	}
 	for _, m := range ms[current:] {
 		if err := s.apply(ctx, m); err != nil {
@@ -275,24 +277,41 @@ func (s *Store) checkSchema(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	current, err := s.schemaVersion(ctx)
+	current, err := schemaHistory(ctx, s.db, ms)
 	if err != nil {
 		return err
 	}
-	switch {
-	case current > len(ms):
-		return fmt.Errorf("%w (database %d, binary %d)", ErrSchemaTooNew, current, len(ms))
-	case current < len(ms):
+	if current < len(ms) {
 		return fmt.Errorf("%w (database %d, binary %d)", ErrSchemaOutdated, current, len(ms))
 	}
 	return nil
 }
 
-func (s *Store) schemaVersion(ctx context.Context) (int, error) {
-	var v int
-	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(version), 0) FROM schema_migrations`).Scan(&v)
+// schemaHistory returns the database's schema version after checking that
+// the applied migrations are exactly versions 1..n of ms, by name.
+func schemaHistory(ctx context.Context, q querier, ms []migration) (int, error) {
+	rows, err := q.QueryContext(ctx, `SELECT version, name FROM schema_migrations ORDER BY version`)
 	if err != nil {
 		return 0, fmt.Errorf("store: read schema version: %w", err)
 	}
-	return v, nil
+	defer func() { _ = rows.Close() }()
+	n := 0
+	for rows.Next() {
+		var v int
+		var name string
+		if err := rows.Scan(&v, &name); err != nil {
+			return 0, fmt.Errorf("store: read schema version: %w", err)
+		}
+		switch {
+		case v > len(ms) && v > n:
+			return 0, fmt.Errorf("%w (database %d, binary %d)", ErrSchemaTooNew, v, len(ms))
+		case v != n+1 || name != ms[n].name:
+			return 0, fmt.Errorf("%w: unexpected migration %d %q", ErrSchemaHistory, v, name)
+		}
+		n++
+	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("store: read schema version: %w", err)
+	}
+	return n, nil
 }
