@@ -56,5 +56,7 @@ func isVerificationFailure(err error) bool {
 		errors.Is(err, audit.ErrCheckpointSignature) ||
 		errors.Is(err, audit.ErrUnknownKey) ||
 		errors.Is(err, audit.ErrUnanchored) ||
+		errors.Is(err, audit.ErrMalformedEntry) ||
+		errors.Is(err, errMalformedCheckpoint) ||
 		errors.Is(err, policy.ErrInvalid)
 }

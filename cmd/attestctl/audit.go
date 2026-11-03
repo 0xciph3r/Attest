@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/ed25519"
 	"encoding/json"
@@ -16,6 +15,7 @@ import (
 
 	"github.com/0xciph3r/attest/internal/audit"
 	"github.com/0xciph3r/attest/internal/store"
+	"github.com/0xciph3r/attest/internal/strictjson"
 )
 
 func newAuditCmd() *cobra.Command {
@@ -274,16 +274,30 @@ func newAuditKeygenCmd() *cobra.Command {
 	return cmd
 }
 
+// errMalformedCheckpoint marks a checkpoint file that could be read but is
+// not a well-formed checkpoint: bad evidence rather than an operational
+// failure.
+var errMalformedCheckpoint = errors.New("malformed checkpoint")
+
+// maxCheckpointSize bounds a checkpoint file; a real one is about 300 bytes.
+const maxCheckpointSize = 16 << 10
+
 func readCheckpoint(path string) (audit.SignedCheckpoint, error) {
-	b, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return audit.SignedCheckpoint{}, err
 	}
+	defer f.Close()
+	b, err := io.ReadAll(io.LimitReader(f, maxCheckpointSize+1))
+	if err != nil {
+		return audit.SignedCheckpoint{}, err
+	}
+	if len(b) > maxCheckpointSize {
+		return audit.SignedCheckpoint{}, fmt.Errorf("%w %s: larger than %d bytes", errMalformedCheckpoint, path, maxCheckpointSize)
+	}
 	var cp audit.SignedCheckpoint
-	dec := json.NewDecoder(bytes.NewReader(b))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&cp); err != nil {
-		return audit.SignedCheckpoint{}, fmt.Errorf("checkpoint %s: %w", path, err)
+	if err := strictjson.Decode(b, &cp); err != nil {
+		return audit.SignedCheckpoint{}, fmt.Errorf("%w %s: %w", errMalformedCheckpoint, path, err)
 	}
 	return cp, nil
 }
@@ -298,15 +312,19 @@ func writeCheckpoint(path string, cp audit.SignedCheckpoint) error {
 	if err != nil {
 		return err
 	}
-	if _, err := f.Write(append(b, '\n')); err != nil {
-		_ = f.Close()
-		return err
+	_, err = f.Write(append(b, '\n'))
+	if err == nil {
+		err = f.Sync()
 	}
-	if err := f.Sync(); err != nil {
-		_ = f.Close()
-		return err
+	if cerr := f.Close(); err == nil {
+		err = cerr
 	}
-	return f.Close()
+	if err != nil {
+		// A partial file would be mistaken for a checkpoint later and
+		// block retrying at the same path.
+		_ = os.Remove(path)
+	}
+	return err
 }
 
 func exportToFile(path string, entries iter.Seq2[audit.Entry, error]) (uint64, error) {
