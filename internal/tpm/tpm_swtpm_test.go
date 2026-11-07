@@ -181,3 +181,58 @@ func TestActivateCredential(t *testing.T) {
 		})
 	}
 }
+
+func loadNodeKey(t *testing.T, dev *swtpmtest.TPM, unique []byte) *tpm.Key {
+	t.Helper()
+	k, err := tpm.LoadNodeKey(dev, unique)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = k.Flush(dev) })
+	return k
+}
+
+func TestNodeKeyIsSelectedByUnique(t *testing.T) {
+	dev := swtpmtest.Open(t)
+	u1, u2 := bytes.Repeat([]byte{1}, tpm.NodeKeyUniqueSize), bytes.Repeat([]byte{2}, tpm.NodeKeyUniqueSize)
+	a, b, c := loadNodeKey(t, dev, u1), loadNodeKey(t, dev, u1), loadNodeKey(t, dev, u2)
+	if !bytes.Equal(a.PublicBytes(), b.PublicBytes()) {
+		t.Fatal("same unique value derived different keys")
+	}
+	if bytes.Equal(a.PublicBytes(), c.PublicBytes()) {
+		t.Fatal("different unique values derived the same key")
+	}
+	if a.Public.ObjectAttributes != tpm.NodeKeyAttributes {
+		t.Fatalf("attributes %+v", a.Public.ObjectAttributes)
+	}
+	if _, err := tpm.LoadNodeKey(dev, u1[:31]); err == nil {
+		t.Fatal("short unique value accepted")
+	}
+}
+
+func TestCertifyNodeKey(t *testing.T) {
+	dev := swtpmtest.Open(t)
+	ak := loadAK(t, dev)
+	key := loadNodeKey(t, dev, make([]byte, tpm.NodeKeyUniqueSize))
+	q := tpm.KeyBindingData([]byte("nonce"), key.Name.Buffer)
+	c, err := tpm.Certify(dev, ak, key, q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := tpm2.Unmarshal[tpm2.TPMSAttest](c.Attest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := a.Attested.Certify()
+	if err != nil || a.Type != tpm2.TPMSTAttestCertify || !bytes.Equal(a.ExtraData.Buffer, q) ||
+		!bytes.Equal(info.Name.Buffer, key.Name.Buffer) {
+		t.Fatalf("certification %+v, %v", a, err)
+	}
+	// A flushed key cannot be certified.
+	if err := key.Flush(dev); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tpm.Certify(dev, ak, key, q); err == nil {
+		t.Fatal("certified a flushed key")
+	}
+}
