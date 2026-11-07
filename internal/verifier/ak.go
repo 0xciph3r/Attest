@@ -26,53 +26,63 @@ type AK struct {
 // exactly the attributes of tpm.AKTemplate. A restricted signing key only
 // signs TPM-generated structures, which is what makes its quotes evidence.
 func ParseAK(b []byte) (*AK, error) {
+	pub, key, name, err := parseSigningKey(b, tpm.AKTemplate.ObjectAttributes, ReasonAKInvalid, "AK")
+	if err != nil {
+		return nil, err
+	}
+	return &AK{Public: *pub, Key: key, Name: name}, nil
+}
+
+// parseSigningKey decodes a TPMT_PUBLIC and requires an ECDSA P-256 key
+// with SHA-256 name and signing scheme, no auth policy and exactly attrs.
+// Failures carry reason r.
+func parseSigningKey(b []byte, attrs tpm2.TPMAObject, r Reason, what string) (*tpm2.TPMTPublic, *ecdsa.PublicKey, []byte, error) {
 	if len(b) > maxPublicSize {
-		return nil, fail(ReasonAKInvalid, "public area too large")
+		return nil, nil, nil, fail(r, "public area too large")
 	}
 	pub, err := decode[tpm2.TPMTPublic](b)
 	if err != nil {
-		return nil, wrap(ReasonAKInvalid, err)
+		return nil, nil, nil, wrap(r, err)
 	}
-	want := tpm.AKTemplate
 	if pub.Type != tpm2.TPMAlgECC || pub.NameAlg != tpm2.TPMAlgSHA256 {
-		return nil, fail(ReasonAKInvalid, "AK must be ECC with SHA-256 name algorithm")
+		return nil, nil, nil, fail(r, "%s must be ECC with SHA-256 name algorithm", what)
 	}
-	if pub.ObjectAttributes != want.ObjectAttributes {
-		return nil, fail(ReasonAKInvalid, "AK attributes differ from the required template")
+	if pub.ObjectAttributes != attrs {
+		return nil, nil, nil, fail(r, "%s attributes differ from the required template", what)
 	}
 	if len(pub.AuthPolicy.Buffer) != 0 {
-		return nil, fail(ReasonAKInvalid, "AK must not have an auth policy")
+		return nil, nil, nil, fail(r, "%s must not have an auth policy", what)
 	}
 	parms, err := pub.Parameters.ECCDetail()
 	if err != nil {
-		return nil, wrap(ReasonAKInvalid, err)
+		return nil, nil, nil, wrap(r, err)
 	}
 	if parms.CurveID != tpm2.TPMECCNistP256 || parms.Symmetric.Algorithm != tpm2.TPMAlgNull ||
 		parms.KDF.Scheme != tpm2.TPMAlgNull || parms.Scheme.Scheme != tpm2.TPMAlgECDSA {
-		return nil, fail(ReasonAKInvalid, "AK must be an ECDSA P-256 key")
+		return nil, nil, nil, fail(r, "%s must be an ECDSA P-256 key", what)
 	}
 	scheme, err := parms.Scheme.Details.ECDSA()
 	if err != nil || scheme.HashAlg != tpm2.TPMAlgSHA256 {
-		return nil, fail(ReasonAKInvalid, "AK signing scheme must be ECDSA-SHA256")
+		return nil, nil, nil, fail(r, "%s signing scheme must be ECDSA-SHA256", what)
 	}
 	point, err := pub.Unique.ECC()
 	if err != nil {
-		return nil, wrap(ReasonAKInvalid, err)
+		return nil, nil, nil, wrap(r, err)
 	}
 	if len(point.X.Buffer) != 32 || len(point.Y.Buffer) != 32 {
-		return nil, fail(ReasonAKInvalid, "AK public point has wrong size")
+		return nil, nil, nil, fail(r, "%s public point has wrong size", what)
 	}
 	key, err := tpm2.ECDSAPub(parms, point)
 	if err != nil || key.Curve != elliptic.P256() {
-		return nil, fail(ReasonAKInvalid, "AK public point is invalid")
+		return nil, nil, nil, fail(r, "%s public point is invalid", what)
 	}
 	// ECDSAPub does not check the point is on the curve.
 	if _, err := key.ECDH(); err != nil {
-		return nil, wrap(ReasonAKInvalid, err)
+		return nil, nil, nil, wrap(r, err)
 	}
 	name, err := tpm2.ObjectName(pub)
 	if err != nil {
-		return nil, wrap(ReasonAKInvalid, err)
+		return nil, nil, nil, wrap(r, err)
 	}
-	return &AK{Public: *pub, Key: key, Name: name.Buffer}, nil
+	return pub, key, name.Buffer, nil
 }
