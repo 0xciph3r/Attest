@@ -266,6 +266,9 @@ type IssueRequest struct {
 	ID        ID
 	PublicKey crypto.PublicKey
 	TTL       time.Duration
+	// NotAfter, if set, further bounds the validity, e.g. to the parent
+	// identity's.
+	NotAfter time.Time
 }
 
 // Issued is an issued identity certificate.
@@ -275,7 +278,8 @@ type Issued struct {
 }
 
 // Issue signs an identity certificate. The validity is clamped to the CA's
-// own; an identity that would be valid for no time at all is refused.
+// own and to req.NotAfter; an identity that would be valid for no time at
+// all is refused.
 func (c *CA) Issue(req IssueRequest) (*Issued, error) {
 	if err := req.ID.validate(); err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrIssue, err)
@@ -299,6 +303,12 @@ func (c *CA) Issue(req IssueRequest) (*Issued, error) {
 	}
 	if !notAfter.After(now) {
 		return nil, fmt.Errorf("%w: valid until %s", ErrCAExpired, c.cert.NotAfter)
+	}
+	if !req.NotAfter.IsZero() && notAfter.After(req.NotAfter) {
+		notAfter = req.NotAfter
+		if !notAfter.After(now) {
+			return nil, fmt.Errorf("%w: requested validity ends at %s", ErrIssue, req.NotAfter)
+		}
 	}
 	serial, err := newSerial(c.opts.Rand)
 	if err != nil {

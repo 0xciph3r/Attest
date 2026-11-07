@@ -543,7 +543,22 @@ func TestIssueRejects(t *testing.T) {
 		t.Fatalf("starts before the CA: %s", is.Cert.NotBefore)
 	}
 
+	// A caller-supplied bound applies too, and an elapsed one is refused.
 	clk.now = t0
+	is, err = c.Issue(IssueRequest{ID: node, PublicKey: good, TTL: time.Hour, NotAfter: t0.Add(time.Minute)})
+	if err != nil || !is.Cert.NotAfter.Equal(t0.Add(time.Minute)) {
+		t.Fatalf("NotAfter bound: %v, %v", is, err)
+	}
+	if is, err := c.Issue(IssueRequest{ID: node, PublicKey: good, TTL: time.Hour, NotAfter: t0.Add(2 * time.Hour)}); err != nil ||
+		!is.Cert.NotAfter.Equal(t0.Add(time.Hour)) {
+		t.Fatalf("later NotAfter: %v, %v", is, err)
+	}
+	for _, na := range []time.Time{t0, t0.Add(-time.Second)} {
+		if _, err := c.Issue(IssueRequest{ID: node, PublicKey: good, TTL: time.Hour, NotAfter: na}); !errors.Is(err, ErrIssue) {
+			t.Fatalf("elapsed NotAfter %s: %v", na, err)
+		}
+	}
+
 	c.opts.Rand = errReader{}
 	if _, err := c.Issue(IssueRequest{ID: node, PublicKey: good, TTL: time.Hour}); err == nil {
 		t.Fatal("issued without entropy")
