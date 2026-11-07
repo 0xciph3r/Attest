@@ -164,6 +164,9 @@ type Verdict struct {
 	VerifiedAt    time.Time
 	AuditSeq      uint64
 	Development   bool
+	// NodeKey is the TPM-resident key bound to this attestation, if the
+	// node asked for one.
+	NodeKey *NodeKey
 }
 
 // Verify checks evidence answering challengeID. Any attempt against a live
@@ -218,6 +221,9 @@ func (s *Service) Verify(ctx context.Context, nodeID, challengeID string, nonce 
 			a.Passed = true
 			meta["reference"] = a.Reference
 			meta["development"] = v.Development
+			if v.NodeKey != nil {
+				meta["key_binding"] = hex.EncodeToString(v.NodeKey.SPKIHash)
+			}
 		}
 		// The verdict is attributed to the node the challenge was issued to.
 		e, err := tx.AppendAudit(audit.Record{Time: now, Actor: actor, Action: action, Object: "node/" + ch.NodeID,
@@ -285,8 +291,11 @@ func (s *Service) verify(tx *store.Tx, now time.Time, nodeID string, ch *store.A
 	a.Reference = res.Reference
 	a.PCRDigest = tpm.PCRDigest(res.Quote.PCRs)
 	a.ResetCount, a.RestartCount = int64(res.Quote.ResetCount), int64(res.Quote.RestartCount)
+	if res.NodeKey != nil {
+		a.KeyBinding = res.NodeKey.SPKIHash
+	}
 	return &Verdict{NodeID: n.ID, PolicyVersion: version, Reference: res.Reference, VerifiedAt: now,
-		Development: n.EKDevelopment}, nil
+		Development: n.EKDevelopment, NodeKey: res.NodeKey}, nil
 }
 
 // evidenceHash commits to everything the node submitted, so a recorded
@@ -306,6 +315,13 @@ func evidenceHash(nonce []byte, ev *Evidence) []byte {
 		field(ev.PCRs[k])
 	}
 	field(ev.EventLog)
+	// Absent key evidence leaves the hash of plain attestations unchanged;
+	// present, it is length-delimited like every other field.
+	if k := ev.NodeKey; k != nil {
+		field(k.Public)
+		field(k.Certify)
+		field(k.CertifySignature)
+	}
 	return h.Sum(nil)
 }
 
