@@ -1,6 +1,7 @@
 package identity
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/sha256"
@@ -239,6 +240,96 @@ func (s *Service) IssueNode(ctx context.Context, nodeID string, attestationID in
 	return out, nil
 }
 
+// IssueWorkload issues an identity for pub to the workload caller is
+// authorized as. parent is the node identity the request was authenticated
+// with: it must verify against the trust bundle, be the live record issued
+// from the node's latest attestation, and name the node the caller was
+// observed on. The identity cannot outlive parent.
+//
+// Requests whose parent does not verify are refused without an audit
+// entry, so unauthenticated callers cannot grow the ledger.
+func (s *Service) IssueWorkload(ctx context.Context, parent *x509.Certificate, caller policy.Caller, pub crypto.PublicKey) (*Identity, error) {
+	if parent == nil {
+		return nil, ErrInvalidRequest
+	}
+	keyHash, err := spkiHash(pub)
+	if err != nil {
+		return nil, err
+	}
+	now := s.now()
+	pid, err := Verify(s.ca.Bundle(), s.ca.TrustDomain(), parent, now, x509.ExtKeyUsageClientAuth)
+	if err != nil {
+		return nil, err
+	}
+	if pid.Kind != KindNode {
+		return nil, fmt.Errorf("%w: %s is not a node identity", ErrUntrusted, pid)
+	}
+	nodeID := pid.Name
+	parentSerial := fmt.Sprintf("%032x", parent.SerialNumber)
+	actor := actorNodePrefix + nodeID
+	meta := map[string]any{"kind": KindWorkload, "parent": parentSerial,
+		"systemd_unit": caller.SystemdUnit, "uid": caller.UID}
+	var out *Identity
+	denial, err := s.update(ctx, now, actor, "node/"+nodeID, meta, func(tx *store.Tx) error {
+		if caller.NodeID != nodeID {
+			meta["claimed_node"] = caller.NodeID
+			return deny(ReasonCallerNodeMismatch, "caller observed on %q, authenticated as %q", caller.NodeID, nodeID)
+		}
+		p, err := tx.Identity(parentSerial)
+		if errors.Is(err, store.ErrNotFound) {
+			// Signed by our CA but unrecorded: e.g. issued before a
+			// restored backup was taken.
+			return deny(ReasonParentUnknown, "no record of identity %s", parentSerial)
+		}
+		if err != nil {
+			return err
+		}
+		parentHash := sha256.Sum256(parent.RawSubjectPublicKeyInfo)
+		if p.Kind != store.IdentityNode || p.NodeID != nodeID || p.SPIFFEID != pid.String() ||
+			!bytes.Equal(p.PublicKeyHash, parentHash[:]) || !p.NotAfter.Equal(parent.NotAfter) {
+			return deny(ReasonParentMismatch, "identity %s does not match its record", parentSerial)
+		}
+		if !p.RevokedAt.IsZero() {
+			return deny(ReasonParentRevoked, "identity %s revoked at %s", parentSerial, p.RevokedAt)
+		}
+		a, err := tx.Attestation(p.AttestationID)
+		if err != nil {
+			return err
+		}
+		if err := s.checkAttestation(tx, a); err != nil {
+			return err
+		}
+		wp, version, err := currentWorkloadPolicy(tx)
+		if err != nil {
+			return err
+		}
+		meta["policy_version"] = version
+		w, err := wp.Match(caller)
+		if err != nil {
+			return deny(ReasonWorkloadNotAllowed, "%v", err)
+		}
+		sid, err := WorkloadID(s.ca.TrustDomain(), w.Name)
+		if err != nil {
+			return err
+		}
+		iss, err := s.ca.Issue(IssueRequest{ID: sid, PublicKey: pub, TTL: w.Lifetime(), NotAfter: p.NotAfter})
+		if err != nil {
+			return err
+		}
+		rec := &store.Identity{Serial: iss.Serial, Kind: store.IdentityWorkload, SPIFFEID: sid.String(), NodeID: nodeID,
+			Workload: w.Name, ParentSerial: parentSerial, AttestationID: a.ID, PolicyVersion: version, PublicKeyHash: keyHash}
+		out, err = s.record(tx, now, actor, rec, iss, meta)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	if denial != nil {
+		return nil, denial
+	}
+	return out, nil
+}
+
 // checkAttestation requires a to be the node's latest attestation, to have
 // passed under the current measurement policy, and the node to be enrolled.
 func (s *Service) checkAttestation(tx *store.Tx, a *store.Attestation) error {
@@ -269,6 +360,24 @@ func (s *Service) checkAttestation(tx *store.Tx, a *store.Attestation) error {
 		return deny(ReasonMeasurementPolicy, "attested under policy v%d, current is v%d", a.PolicyVersion, m.Version)
 	}
 	return nil
+}
+
+func currentWorkloadPolicy(tx *store.Tx) (*policy.WorkloadPolicy, int64, error) {
+	p, err := tx.CurrentPolicy(store.PolicyWorkload)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil, 0, deny(ReasonWorkloadPolicyMissing, "no workload policy has been applied")
+	}
+	if err != nil {
+		return nil, 0, err
+	}
+	wp, err := policy.ParseWorkload(p.Document)
+	if err != nil {
+		return nil, 0, fmt.Errorf("identity: stored workload policy v%d: %w", p.Version, err)
+	}
+	if !bytes.Equal(wp.Digest(), p.Digest) {
+		return nil, 0, fmt.Errorf("identity: stored workload policy v%d digest mismatch", p.Version)
+	}
+	return wp, p.Version, nil
 }
 
 // update runs fn in a transaction. fn writes nothing before it decides, so

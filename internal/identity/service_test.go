@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/0xciph3r/attest/internal/audit"
+	"github.com/0xciph3r/attest/internal/policy"
 	"github.com/0xciph3r/attest/internal/store"
 )
 
@@ -28,6 +29,8 @@ var bg = context.Background()
 const apiPolicy = `{"schema":"attest.dev/workload-policy/v1","workloads":[
 	{"name":"api","nodes":["n1"],"systemd_unit":"api.service","uid":1000,"ttl":"15m"},
 	{"name":"db","nodes":["n2"],"systemd_unit":"db.service","uid":1001}]}`
+
+var apiCaller = policy.Caller{NodeID: "n1", SystemdUnit: "api.service", UID: 1000}
 
 type svcEnv struct {
 	t   *testing.T
@@ -150,6 +153,17 @@ func (e *svcEnv) audit() (n int, action string, meta map[string]any) {
 		e.t.Fatal(err)
 	}
 	return n, last.Action, meta
+}
+
+// nodeIdentity attests n1 with a fresh key and issues its node identity.
+func (e *svcEnv) nodeIdentity() (*Identity, *ecdsa.PrivateKey) {
+	e.t.Helper()
+	k := p256(e.t)
+	id, err := e.svc.IssueNode(bg, "n1", e.attest("n1", true, k.Public()), k.Public())
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	return id, k
 }
 
 // expectDenied runs op and checks it was refused for reason, audited as a
@@ -471,4 +485,183 @@ func TestApplyWorkloadPolicy(t *testing.T) {
 	if _, action, meta := e.audit(); action != ActionPolicyApply || meta["kind"] != "workload" || meta["workloads"] != float64(2) {
 		t.Fatalf("audit %s %v", action, meta)
 	}
+}
+
+func TestIssueWorkload(t *testing.T) {
+	e := newEnv(t)
+	version := e.applyPolicy(apiPolicy)
+	parent, _ := e.nodeIdentity()
+	wk := p256(t)
+
+	id, err := e.svc.IssueWorkload(bg, parent.Cert, apiCaller, wk.Public())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := must(WorkloadID("attest.local", "api"))
+	for _, usage := range []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth} {
+		if got, err := Verify(id.Bundle, "attest.local", id.Cert, e.clk.now, usage); err != nil || got != want {
+			t.Fatalf("verify %v: %v, %v", usage, got, err)
+		}
+	}
+	if !id.Cert.NotAfter.Equal(e.clk.now.Add(15 * time.Minute)) {
+		t.Fatalf("valid until %s", id.Cert.NotAfter)
+	}
+	rec, err := e.st.Identity(bg, id.Serial)
+	if err != nil || rec.Kind != store.IdentityWorkload || rec.Workload != "api" || rec.ParentSerial != parent.Serial ||
+		rec.PolicyVersion != version || rec.NodeID != "n1" || !bytes.Equal(rec.PublicKeyHash, mustHash(t, wk.Public())) {
+		t.Fatalf("record %+v, %v", rec, err)
+	}
+	if _, action, meta := e.audit(); action != ActionIssue || meta["parent"] != parent.Serial ||
+		meta["systemd_unit"] != "api.service" || meta["policy_version"] != float64(version) {
+		t.Fatalf("audit %s %v", action, meta)
+	}
+
+	// Renewal near the end of the parent's life is capped by it.
+	e.clk.now = parent.Cert.NotAfter.Add(-5 * time.Minute)
+	id, err = e.svc.IssueWorkload(bg, parent.Cert, apiCaller, wk.Public())
+	if err != nil || !id.Cert.NotAfter.Equal(parent.Cert.NotAfter) {
+		t.Fatalf("capped renewal: %v, %v", id, err)
+	}
+}
+
+func TestIssueWorkloadDenied(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		reason Reason
+		// setup may change state and returns the caller to request as.
+		setup func(e *svcEnv, parent *Identity) policy.Caller
+	}{
+		{"caller on another node", ReasonCallerNodeMismatch, func(*svcEnv, *Identity) policy.Caller {
+			c := apiCaller
+			c.NodeID = "n2"
+			return c
+		}},
+		{"wrong systemd unit", ReasonWorkloadNotAllowed, func(*svcEnv, *Identity) policy.Caller {
+			c := apiCaller
+			c.SystemdUnit = "db.service"
+			return c
+		}},
+		{"wrong uid", ReasonWorkloadNotAllowed, func(*svcEnv, *Identity) policy.Caller {
+			c := apiCaller
+			c.UID = 0
+			return c
+		}},
+		// db's rule names its unit and UID, but only on n2.
+		{"workload on a node it is not assigned", ReasonWorkloadNotAllowed, func(*svcEnv, *Identity) policy.Caller {
+			return policy.Caller{NodeID: "n1", SystemdUnit: "db.service", UID: 1001}
+		}},
+		{"workload removed from policy", ReasonWorkloadNotAllowed, func(e *svcEnv, _ *Identity) policy.Caller {
+			e.applyPolicy(`{"schema":"attest.dev/workload-policy/v1","workloads":[]}`)
+			return apiCaller
+		}},
+		{"parent revoked", ReasonParentRevoked, func(e *svcEnv, p *Identity) policy.Caller {
+			e.update(func(tx *store.Tx) error { return tx.RevokeIdentity(p.Serial, e.clk.now) })
+			return apiCaller
+		}},
+		{"node revoked", ReasonNodeNotEnrolled, func(e *svcEnv, _ *Identity) policy.Caller {
+			e.update(func(tx *store.Tx) error { return tx.RevokeNode("n1", e.clk.now) })
+			return apiCaller
+		}},
+		{"node attested again", ReasonAttestationSuperseded, func(e *svcEnv, _ *Identity) policy.Caller {
+			e.attest("n1", true, p256(e.t).Public())
+			return apiCaller
+		}},
+		{"node failed a later attestation", ReasonAttestationSuperseded, func(e *svcEnv, _ *Identity) policy.Caller {
+			e.attest("n1", false, nil)
+			return apiCaller
+		}},
+		{"measurement policy changed", ReasonMeasurementPolicy, func(e *svcEnv, _ *Identity) policy.Caller {
+			e.update(func(tx *store.Tx) error {
+				_, err := tx.InsertPolicy(&store.Policy{Kind: store.PolicyMeasurement, Document: []byte("{}"),
+					Digest: make([]byte, 32), CreatedAt: t0, CreatedBy: "op"})
+				return err
+			})
+			return apiCaller
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newEnv(t)
+			e.applyPolicy(apiPolicy)
+			parent, _ := e.nodeIdentity()
+			caller := tc.setup(e, parent)
+			meta := e.expectDenied(tc.name, tc.reason, func() (*Identity, error) {
+				return e.svc.IssueWorkload(bg, parent.Cert, caller, p256(t).Public())
+			})
+			if meta != nil && (meta["parent"] != parent.Serial || meta["kind"] != "workload") {
+				t.Errorf("denial metadata %v", meta)
+			}
+		})
+	}
+}
+
+func TestIssueWorkloadWithoutPolicy(t *testing.T) {
+	e := newEnv(t)
+	parent, _ := e.nodeIdentity()
+	e.expectDenied("no policy", ReasonWorkloadPolicyMissing, func() (*Identity, error) {
+		return e.svc.IssueWorkload(bg, parent.Cert, apiCaller, p256(t).Public())
+	})
+}
+
+// A parent certificate our CA signed that does not match the record of its
+// serial, or has none (as after restoring an older backup), is refused.
+func TestIssueWorkloadUnrecordedParent(t *testing.T) {
+	e := newEnv(t)
+	e.applyPolicy(apiPolicy)
+	parent, _ := e.nodeIdentity()
+	n1 := must(NodeID("attest.local", "n1"))
+
+	unrecorded, err := e.ca.Issue(IssueRequest{ID: n1, PublicKey: p256(t).Public(), TTL: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.expectDenied("unrecorded", ReasonParentUnknown, func() (*Identity, error) {
+		return e.svc.IssueWorkload(bg, unrecorded.Cert, apiCaller, p256(t).Public())
+	})
+
+	// Same serial as the real parent, but another key or validity.
+	o := opts(e.clk)
+	o.Rand = bytes.NewReader(parent.Cert.SerialNumber.FillBytes(make([]byte, 16)))
+	twin, err := Load(e.dir, o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forged, err := twin.Issue(IssueRequest{ID: n1, PublicKey: p256(t).Public(), TTL: time.Hour})
+	if err != nil || forged.Serial != parent.Serial {
+		t.Fatalf("forging serial: %v, %v", forged, err)
+	}
+	e.expectDenied("other key", ReasonParentMismatch, func() (*Identity, error) {
+		return e.svc.IssueWorkload(bg, forged.Cert, apiCaller, p256(t).Public())
+	})
+}
+
+func TestIssueWorkloadRefusesUnauthenticated(t *testing.T) {
+	e := newEnv(t)
+	e.applyPolicy(apiPolicy)
+	parent, _ := e.nodeIdentity()
+	wl, err := e.svc.IssueWorkload(bg, parent.Cert, apiCaller, p256(t).Public())
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, _, _ := newCAInDir(t)
+	foreign, err := other.Issue(IssueRequest{ID: must(NodeID("attest.local", "n1")), PublicKey: p256(t).Public(), TTL: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	e.expectRefused("nil parent", ErrInvalidRequest, func() (*Identity, error) {
+		return e.svc.IssueWorkload(bg, nil, apiCaller, p256(t).Public())
+	})
+	e.expectRefused("invalid key", ErrInvalidRequest, func() (*Identity, error) {
+		return e.svc.IssueWorkload(bg, parent.Cert, apiCaller, nil)
+	})
+	e.expectRefused("parent from another CA", ErrUntrusted, func() (*Identity, error) {
+		return e.svc.IssueWorkload(bg, foreign.Cert, apiCaller, p256(t).Public())
+	})
+	e.expectRefused("workload identity as parent", ErrUntrusted, func() (*Identity, error) {
+		return e.svc.IssueWorkload(bg, wl.Cert, apiCaller, p256(t).Public())
+	})
+	e.clk.now = parent.Cert.NotAfter.Add(time.Second)
+	e.expectRefused("expired parent", ErrUntrusted, func() (*Identity, error) {
+		return e.svc.IssueWorkload(bg, parent.Cert, apiCaller, p256(t).Public())
+	})
 }
