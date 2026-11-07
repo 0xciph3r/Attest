@@ -1,0 +1,135 @@
+syntax = "proto3";
+
+package attest.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/0xciph3r/attest/api/gen/attest/v1;attestv1";
+
+// NodeService is the API node agents use over TLS.
+//
+// Enrollment and attestation are authenticated by the TPM, not by the
+// transport: the server checks credential activation and quote signatures
+// against the operator-registered EK and the enrolled AK. A node therefore
+// calls them without a client certificate. IssueWorkloadIdentity requires
+// the node identity obtained from Attest as the TLS client certificate.
+//
+// Denials are returned as PERMISSION_DENIED with a google.rpc.ErrorInfo
+// detail in domain "attest.dev" whose reason is the stable denial code
+// (for example "pcr_digest_mismatch"). Malformed requests are
+// INVALID_ARGUMENT; requests without a valid client certificate where one
+// is required are UNAUTHENTICATED.
+service NodeService {
+  // BeginEnrollment starts credential activation for the node's AK.
+  rpc BeginEnrollment(BeginEnrollmentRequest) returns (BeginEnrollmentResponse);
+  // CompleteEnrollment proves the TPM holding the registered EK and the
+  // AK recovered the activation secret. One attempt per challenge.
+  rpc CompleteEnrollment(CompleteEnrollmentRequest) returns (CompleteEnrollmentResponse);
+  // GetChallenge issues a fresh, single-use attestation nonce.
+  rpc GetChallenge(GetChallengeRequest) returns (GetChallengeResponse);
+  // Attest verifies a quote answering a challenge. If the evidence binds a
+  // TPM-resident node key, a passing attestation also returns a node
+  // identity for that key.
+  rpc Attest(AttestRequest) returns (AttestResponse);
+  // IssueWorkloadIdentity issues an identity to a local workload the agent
+  // observed, if the current workload policy authorizes it on this node.
+  rpc IssueWorkloadIdentity(IssueWorkloadIdentityRequest) returns (IssueWorkloadIdentityResponse);
+}
+
+message BeginEnrollmentRequest {
+  string node_id = 1;
+  // TPMT_PUBLIC of the attestation key.
+  bytes ak_public = 2;
+}
+
+message BeginEnrollmentResponse {
+  string challenge_id = 1;
+  // TPM2_ActivateCredential inputs.
+  bytes credential_blob = 2;
+  bytes encrypted_secret = 3;
+  google.protobuf.Timestamp expires_at = 4;
+}
+
+message CompleteEnrollmentRequest {
+  string node_id = 1;
+  string challenge_id = 2;
+  bytes secret = 3;
+}
+
+message CompleteEnrollmentResponse {}
+
+message GetChallengeRequest {
+  string node_id = 1;
+}
+
+message GetChallengeResponse {
+  string challenge_id = 1;
+  bytes nonce = 2;
+  // PCR indices (SHA-256 bank) the quote must cover.
+  repeated uint32 pcrs = 3;
+  google.protobuf.Timestamp expires_at = 4;
+}
+
+message AttestRequest {
+  string node_id = 1;
+  string challenge_id = 2;
+  bytes nonce = 3;
+  Evidence evidence = 4;
+}
+
+message Evidence {
+  // TPMS_ATTEST of the quote.
+  bytes attest = 1;
+  // TPMT_SIGNATURE by the AK.
+  bytes signature = 2;
+  // Claimed SHA-256 PCR values, by index.
+  map<uint32, bytes> pcrs = 3;
+  // TCG crypto-agile measured-boot event log.
+  bytes event_log = 4;
+  // Optional TPM-resident key to bind and certify as the node identity
+  // key. When set, the quote's qualifying data is the key binding.
+  NodeKeyEvidence node_key = 5;
+}
+
+message NodeKeyEvidence {
+  // TPMT_PUBLIC of the node key.
+  bytes public = 1;
+  // TPMS_ATTEST of TPM2_Certify by the AK.
+  bytes certify = 2;
+  // TPMT_SIGNATURE over certify.
+  bytes certify_signature = 3;
+}
+
+message AttestResponse {
+  int64 attestation_id = 1;
+  int64 policy_version = 2;
+  string reference = 3;
+  google.protobuf.Timestamp verified_at = 4;
+  // Set when the evidence bound a node key.
+  X509Identity identity = 5;
+}
+
+message IssueWorkloadIdentityRequest {
+  // The local boundary the agent observed for the workload. The node is
+  // the one named by the client certificate.
+  string systemd_unit = 1;
+  uint32 uid = 2;
+  // PKCS#10 request, DER, signed by the workload's ECDSA P-256 key. Only
+  // the key and the proof of possession are used; subject and extensions
+  // are ignored.
+  bytes csr = 3;
+}
+
+message IssueWorkloadIdentityResponse {
+  X509Identity identity = 1;
+}
+
+// X509Identity is an issued X.509-SVID.
+message X509Identity {
+  string spiffe_id = 1;
+  // Leaf certificate, DER.
+  bytes certificate = 2;
+  // Trust bundle CA certificates, DER, current CA first.
+  repeated bytes bundle = 3;
+  google.protobuf.Timestamp not_after = 4;
+}

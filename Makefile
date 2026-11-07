@@ -5,7 +5,8 @@ LDFLAGS   := -s -w
 # Static, CGO-free Linux binaries are the release target.
 LINUX_ARCHES := amd64 arm64
 
-.PHONY: all build test race e2e lint vet fmt-check vuln linux check clean swtpm-up swtpm-down test-tpm
+.PHONY: all build test race e2e lint vet fmt-check vuln linux check clean swtpm-up swtpm-down test-tpm \
+	generate generate-check proto-lint tools
 
 all: check build
 
@@ -44,6 +45,36 @@ check: fmt-check vet lint race e2e
 
 clean:
 	rm -rf $(BIN)
+
+# --- API code generation ------------------------------------------------------
+# Generator versions are pinned and installed into .tools so generated code
+# is reproducible; it is committed and CI rejects stale output.
+TOOLS                  := $(CURDIR)/.tools
+BUF_VERSION            := v1.74.0
+PROTOC_GEN_GO_VERSION  := v1.34.2
+PROTOC_GEN_GRPC_VERSION := v1.5.1
+BUF := $(TOOLS)/buf
+
+$(TOOLS)/.v-$(BUF_VERSION)-$(PROTOC_GEN_GO_VERSION)-$(PROTOC_GEN_GRPC_VERSION):
+	@rm -rf $(TOOLS) && mkdir -p $(TOOLS)
+	GOBIN=$(TOOLS) $(GO) install github.com/bufbuild/buf/cmd/buf@$(BUF_VERSION)
+	GOBIN=$(TOOLS) $(GO) install google.golang.org/protobuf/cmd/protoc-gen-go@$(PROTOC_GEN_GO_VERSION)
+	GOBIN=$(TOOLS) $(GO) install google.golang.org/grpc/cmd/protoc-gen-go-grpc@$(PROTOC_GEN_GRPC_VERSION)
+	@touch $@
+
+tools: $(TOOLS)/.v-$(BUF_VERSION)-$(PROTOC_GEN_GO_VERSION)-$(PROTOC_GEN_GRPC_VERSION)
+
+proto-lint: tools
+	$(BUF) lint
+
+generate: tools proto-lint
+	@rm -rf api/gen
+	PATH=$(TOOLS):$$PATH $(BUF) generate
+
+generate-check: generate
+	@git diff --exit-code -- api/gen && \
+	  test -z "$$(git status --porcelain -- api/gen)" || \
+	  { echo "generated API code is stale: run make generate"; exit 1; }
 
 # --- Development software TPM (Docker) ---------------------------------------
 SWTPM_IMAGE ?= attest-swtpm

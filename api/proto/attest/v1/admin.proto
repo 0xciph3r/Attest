@@ -1,0 +1,93 @@
+syntax = "proto3";
+
+package attest.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/0xciph3r/attest/api/gen/attest/v1;attestv1";
+
+// AdminService is the operator API. attestd serves it only on a local Unix
+// socket; callers are authenticated by the kernel-reported peer UID against
+// the configured operator allowlist, and every state change is audited
+// with that operator as the actor.
+service AdminService {
+  rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
+  // RegisterNode approves a node by its EK certificate. Only registered
+  // nodes can enroll.
+  rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse);
+  rpc RevokeNode(RevokeNodeRequest) returns (RevokeNodeResponse);
+  rpc ListNodes(ListNodesRequest) returns (ListNodesResponse);
+  // ApplyPolicy validates a policy document and makes it current.
+  rpc ApplyPolicy(ApplyPolicyRequest) returns (ApplyPolicyResponse);
+}
+
+message GetStatusRequest {}
+
+message GetStatusResponse {
+  string version = 1;
+  string trust_domain = 2;
+  // Current CA validity.
+  google.protobuf.Timestamp ca_not_after = 3;
+  // Audit ledger head.
+  uint64 audit_sequence = 4;
+  bytes audit_head_hash = 5;
+}
+
+message RegisterNodeRequest {
+  string node_id = 1;
+  // EK certificate, DER.
+  bytes ek_certificate = 2;
+}
+
+message RegisterNodeResponse {
+  Node node = 1;
+}
+
+message RevokeNodeRequest {
+  string node_id = 1;
+}
+
+message RevokeNodeResponse {}
+
+message ListNodesRequest {}
+
+message ListNodesResponse {
+  repeated Node nodes = 1;
+}
+
+enum NodeState {
+  NODE_STATE_UNSPECIFIED = 0;
+  NODE_STATE_REGISTERED = 1;
+  NODE_STATE_ENROLLED = 2;
+  NODE_STATE_REVOKED = 3;
+}
+
+message Node {
+  string id = 1;
+  NodeState state = 2;
+  string ek_type = 3;
+  // SHA-256 of the EK public area.
+  bytes ek_digest = 4;
+  // The EK chains only to a development (e.g. swtpm) root.
+  bool ek_development = 5;
+  string registered_by = 6;
+  google.protobuf.Timestamp registered_at = 7;
+  google.protobuf.Timestamp enrolled_at = 8;
+  google.protobuf.Timestamp revoked_at = 9;
+}
+
+enum PolicyKind {
+  POLICY_KIND_UNSPECIFIED = 0;
+  POLICY_KIND_MEASUREMENT = 1;
+  POLICY_KIND_WORKLOAD = 2;
+}
+
+message ApplyPolicyRequest {
+  PolicyKind kind = 1;
+  // The policy document, JSON.
+  bytes document = 2;
+}
+
+message ApplyPolicyResponse {
+  int64 version = 1;
+}

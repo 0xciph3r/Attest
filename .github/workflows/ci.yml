@@ -43,6 +43,16 @@ jobs:
         if: failure()
         run: docker logs attest-swtpm || true
 
+  proto:
+    # buf lint, and generated API code must match the .proto sources.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: make generate-check
+
   lint:
     runs-on: ubuntu-latest
     steps:
