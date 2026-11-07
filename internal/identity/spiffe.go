@@ -22,6 +22,8 @@ type Kind string
 const (
 	KindNode     Kind = "node"
 	KindWorkload Kind = "workload"
+	// KindServer names the control plane's TLS server identity.
+	KindServer Kind = "server"
 )
 
 // ErrInvalidID reports a malformed or out-of-scope SPIFFE ID.
@@ -49,6 +51,9 @@ func NodeID(td, nodeID string) (ID, error) { return newID(td, KindNode, nodeID) 
 // WorkloadID returns the SPIFFE ID of a workload.
 func WorkloadID(td, name string) (ID, error) { return newID(td, KindWorkload, name) }
 
+// ServerID returns the SPIFFE ID of a control-plane server.
+func ServerID(td, name string) (ID, error) { return newID(td, KindServer, name) }
+
 func newID(td string, k Kind, name string) (ID, error) {
 	id := ID{TrustDomain: td, Kind: k, Name: name}
 	if err := id.validate(); err != nil {
@@ -66,7 +71,7 @@ func (id ID) validate() error {
 		if !policy.ValidNodeID(id.Name) {
 			return fmt.Errorf("%w: node ID %q", ErrInvalidID, id.Name)
 		}
-	case KindWorkload:
+	case KindWorkload, KindServer:
 		if !policy.ValidWorkloadName(id.Name) {
 			return fmt.Errorf("%w: workload name %q", ErrInvalidID, id.Name)
 		}

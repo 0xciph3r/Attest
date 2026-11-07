@@ -111,6 +111,16 @@ func TestCALifecycle(t *testing.T) {
 	if n.Serial == w.Serial {
 		t.Fatal("serials repeat")
 	}
+	// The server identity cannot authenticate as a client, so it cannot
+	// stand in for a node identity.
+	srvID := must(ServerID("attest.local", "attestd"))
+	srv := issue(t, l, srvID, time.Hour)
+	if id, err := Verify(l.Bundle(), "attest.local", srv.Cert, t0, x509.ExtKeyUsageServerAuth); err != nil || id != srvID {
+		t.Fatalf("Verify server: %v, %v", id, err)
+	}
+	if _, err := Verify(l.Bundle(), "attest.local", srv.Cert, t0, x509.ExtKeyUsageClientAuth); !errors.Is(err, ErrUntrusted) {
+		t.Fatalf("server cert as client: %v", err)
+	}
 
 	// Rotation keeps identities from the previous CA valid; a second
 	// rotation drops it.

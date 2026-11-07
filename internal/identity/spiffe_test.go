@@ -15,7 +15,11 @@ func TestIDRoundTrip(t *testing.T) {
 	if err != nil || w.String() != "spiffe://prod.example/workload/payments" {
 		t.Fatalf("%v, %v", w, err)
 	}
-	for _, id := range []ID{n, w} {
+	srv, err := ServerID("attest.local", "attestd")
+	if err != nil || srv.String() != "spiffe://attest.local/server/attestd" {
+		t.Fatalf("%v, %v", srv, err)
+	}
+	for _, id := range []ID{n, w, srv} {
 		got, err := ParseID(id.String())
 		if err != nil || got != id {
 			t.Fatalf("ParseID(%s) = %+v, %v", id, got, err)
@@ -47,6 +51,11 @@ func TestIDRejects(t *testing.T) {
 			t.Errorf("WorkloadID(%q): %v", name, err)
 		}
 	}
+	for _, name := range []string{"", "Attestd", "attestd/x", "../ca"} {
+		if _, err := ServerID("attest.local", name); !errors.Is(err, ErrInvalidID) {
+			t.Errorf("ServerID(%q): %v", name, err)
+		}
+	}
 	if _, err := newID("attest.local", Kind("admin"), "root"); !errors.Is(err, ErrInvalidID) {
 		t.Errorf("unknown kind: %v", err)
 	}
@@ -63,6 +72,9 @@ func TestParseIDRejects(t *testing.T) {
 		"spiffe://attest.local/node/node-1/extra",
 		"spiffe://attest.local//node/node-1",
 		"spiffe://attest.local/admin/root",
+		"spiffe://attest.local/server/",
+		"spiffe://attest.local/server/attestd/x",
+		"spiffe://attest.local/Server/attestd",
 		"spiffe://attest.local/workload/Payments",
 		"spiffe://attest.local/node/node%2D1",
 		"spiffe://attest.local/node/../workload/x",

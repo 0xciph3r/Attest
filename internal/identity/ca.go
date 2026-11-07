@@ -314,9 +314,16 @@ func (c *CA) Issue(req IssueRequest) (*Issued, error) {
 	if err != nil {
 		return nil, err
 	}
-	usage := []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}
-	if req.ID.Kind == KindWorkload {
-		usage = append(usage, x509.ExtKeyUsageServerAuth)
+	// Nodes only authenticate to the control plane; the control plane only
+	// serves; workloads do both.
+	var usage []x509.ExtKeyUsage
+	switch req.ID.Kind {
+	case KindNode:
+		usage = []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}
+	case KindServer:
+		usage = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}
+	default:
+		usage = []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth}
 	}
 	tmpl := &x509.Certificate{
 		SerialNumber:          serial,
