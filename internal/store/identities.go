@@ -97,3 +97,15 @@ func getIdentity(ctx context.Context, q querier, serial string) (*Identity, erro
 	id.AuditSeq = uint64(a) //nolint:gosec // schema: audit_seq > 0
 	return &id, nil
 }
+
+// NodeIdentityForAttestation returns the node identity issued from an
+// attestation, or ErrNotFound if none was.
+func (t *Tx) NodeIdentityForAttestation(attestationID int64) (*Identity, error) {
+	var serial string
+	err := t.queryRow(`SELECT serial FROM identity_records WHERE attestation_id = ? AND kind = 'node'`,
+		attestationID).Scan(&serial)
+	if err != nil {
+		return nil, notFound(err, fmt.Sprintf("node identity for attestation %d", attestationID))
+	}
+	return t.Identity(serial)
+}

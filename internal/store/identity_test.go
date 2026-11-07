@@ -86,6 +86,19 @@ func TestIdentityRecords(t *testing.T) {
 	if err := insert(workloadID(wl, node, now.Add(time.Minute))); err != nil {
 		t.Fatal(err)
 	}
+	mustUpdate(t, s, func(tx *Tx) error {
+		if got, err := tx.NodeIdentityForAttestation(attID); err != nil || got.Serial != node {
+			t.Errorf("node identity for attestation: %+v, %v", got, err)
+		}
+		// The failed attestation issued nothing; workload records under
+		// attID are not node identities.
+		for _, id := range []int64{attID + 1, 0, -1} {
+			if got, err := tx.NodeIdentityForAttestation(id); !errors.Is(err, ErrNotFound) {
+				t.Errorf("attestation %d: %+v, %v", id, got, err)
+			}
+		}
+		return nil
+	})
 
 	for name, id := range map[string]*Identity{
 		"second node identity for one attestation": nodeID("00000000000000000000000000000003", attID, digest(7)),
