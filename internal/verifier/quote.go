@@ -27,6 +27,10 @@ type Evidence struct {
 	Signature []byte            // TPMT_SIGNATURE
 	PCRs      map[uint32][]byte // claimed SHA-256 PCR values
 	EventLog  []byte            // TCG crypto-agile event log
+	// NodeKey, if set, asks for a TPM-resident key to be bound to the
+	// attestation. The quote must then carry tpm.KeyBindingData rather
+	// than the bare nonce.
+	NodeKey *KeyEvidence
 }
 
 // QuoteInfo is the authenticated content of a verified quote.

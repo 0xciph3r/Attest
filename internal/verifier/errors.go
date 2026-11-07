@@ -39,6 +39,9 @@ const (
 	ReasonNodeState          Reason = "node_state_invalid"
 	ReasonAKInUse            Reason = "ak_in_use"
 	ReasonPolicyMissing      Reason = "policy_missing"
+	ReasonKeyInvalid         Reason = "node_key_invalid"
+	ReasonNotCertify         Reason = "not_a_certification"
+	ReasonKeyBinding         Reason = "key_binding_mismatch"
 )
 
 // Error is a verification failure.
