@@ -322,3 +322,94 @@ func TestEnrollmentRequiresApprovedTPM(t *testing.T) {
 		t.Fatal("a different TPM activated the credential")
 	}
 }
+
+// boundEvidence binds the node key to ch with a real quote and
+// certification, as the agent does.
+func (c *chain) boundEvidence(ch *verifier.Challenge, key *tpm.Key, log []byte) *verifier.Evidence {
+	c.t.Helper()
+	q := tpm.KeyBindingData(ch.Nonce, key.Name.Buffer)
+	cert, err := tpm.Certify(c.dev, c.ak, key, q)
+	if err != nil {
+		c.t.Fatal(err)
+	}
+	quote, err := tpm.MakeQuote(c.dev, c.ak, q, ch.PCRs)
+	if err != nil {
+		c.t.Fatal(err)
+	}
+	return &verifier.Evidence{Attest: quote.Attest, Signature: quote.Signature, PCRs: quote.PCRs, EventLog: log,
+		NodeKey: &verifier.KeyEvidence{Public: key.PublicBytes(), Certify: cert.Attest, CertifySignature: cert.Signature}}
+}
+
+func TestNodeKeyBinding(t *testing.T) {
+	c := newChain(t, tpm.EKECCP256)
+	boot := eventlog.SimulatedBoot("v1")
+	c.dev.Boot(t, boot)
+	c.applyPolicy(boot)
+	c.register("node-1")
+	c.enrollNode("node-1")
+	unique := bytes.Repeat([]byte{0x5a}, tpm.NodeKeyUniqueSize)
+	loadKey := func() *tpm.Key {
+		k, err := tpm.LoadNodeKey(c.dev, unique)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = k.Flush(c.dev) })
+		return k
+	}
+	key := loadKey()
+	want, err := verifier.ParseNodeKey(key.PublicBytes())
+	if err != nil {
+		t.Fatalf("TPM node key rejected: %v", err)
+	}
+	attest := func(ev func(ch *verifier.Challenge) *verifier.Evidence) (*verifier.Verdict, error) {
+		t.Helper()
+		ch, err := c.attest.Challenge(ctx, "node-1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c.attest.Verify(ctx, "node-1", ch.ID, ch.Nonce, ev(ch))
+	}
+
+	v, err := attest(func(ch *verifier.Challenge) *verifier.Evidence { return c.boundEvidence(ch, key, boot.Bytes()) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := c.st.LatestAttestation(ctx, "node-1")
+	if err != nil || !bytes.Equal(v.NodeKey.SPKIHash, want.SPKIHash) || !bytes.Equal(a.KeyBinding, want.SPKIHash) {
+		t.Fatalf("binding %+v %+v, %v", v.NodeKey, a, err)
+	}
+
+	t.Run("AK certified as the node key", func(t *testing.T) {
+		_, err := attest(func(ch *verifier.Challenge) *verifier.Evidence { return c.boundEvidence(ch, c.ak, boot.Bytes()) })
+		wantReason(t, err, verifier.ReasonKeyInvalid)
+	})
+
+	t.Run("certification from before a reboot", func(t *testing.T) {
+		ch, err := c.attest.Challenge(ctx, "node-1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		old := c.boundEvidence(ch, key, boot.Bytes())
+		c.reboot(boot)
+		key = loadKey()
+		fresh := c.boundEvidence(ch, key, boot.Bytes())
+		fresh.NodeKey.Certify, fresh.NodeKey.CertifySignature = old.NodeKey.Certify, old.NodeKey.CertifySignature
+		_, err = c.attest.Verify(ctx, "node-1", ch.ID, ch.Nonce, fresh)
+		wantReason(t, err, verifier.ReasonKeyBinding)
+	})
+
+	t.Run("same key after reboot", func(t *testing.T) {
+		v, err := attest(func(ch *verifier.Challenge) *verifier.Evidence { return c.boundEvidence(ch, key, boot.Bytes()) })
+		if err != nil || !bytes.Equal(v.NodeKey.SPKIHash, want.SPKIHash) {
+			t.Fatalf("%+v, %v", v, err)
+		}
+	})
+
+	t.Run("bound key does not bypass measurements", func(t *testing.T) {
+		other := eventlog.SimulatedBoot("v2")
+		c.reboot(other)
+		key = loadKey()
+		_, err := attest(func(ch *verifier.Challenge) *verifier.Evidence { return c.boundEvidence(ch, key, other.Bytes()) })
+		wantReason(t, err, verifier.ReasonMeasurement)
+	})
+}
