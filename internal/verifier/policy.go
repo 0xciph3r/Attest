@@ -14,7 +14,10 @@ import (
 // parses or whose digest differs is an internal error, so the caller fails
 // closed without recording a verdict.
 func CurrentPolicy(tx *store.Tx) (*policy.Measurement, int64, error) {
-	p, err := tx.CurrentPolicy(store.PolicyMeasurement)
+	return parseCurrent(tx.CurrentPolicy(store.PolicyMeasurement))
+}
+
+func parseCurrent(p *store.Policy, err error) (*policy.Measurement, int64, error) {
 	if errors.Is(err, store.ErrNotFound) {
 		return nil, 0, fail(ReasonPolicyMissing, "no measurement policy has been applied")
 	}

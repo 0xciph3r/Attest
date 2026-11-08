@@ -9,6 +9,7 @@ import (
 	"github.com/google/go-tpm/tpm2"
 
 	"github.com/0xciph3r/attest/internal/eventlog"
+	"github.com/0xciph3r/attest/internal/verifier/verifiertest"
 )
 
 func TestVerifyEvidenceAccepts(t *testing.T) {
@@ -196,4 +197,64 @@ func TestParseAKRejects(t *testing.T) {
 			t.Fatal("unexpected AK name")
 		}
 	})
+}
+
+func TestAuthenticateEvidence(t *testing.T) {
+	f := newFixture(t)
+	if err := AuthenticateEvidence(f.ak.ak, f.nonce, f.ev); err != nil {
+		t.Fatalf("honest evidence: %v", err)
+	}
+	// Authentication says who produced the quote, not whether it is good:
+	// wrong measurements and a bad event log still authenticate.
+	bad := *f.ev
+	bad.EventLog = []byte("junk")
+	pcrs := maps.Clone(f.ev.PCRs)
+	for k := range pcrs {
+		pcrs[k] = bytes.Repeat([]byte{9}, 32)
+	}
+	bad.PCRs = pcrs
+	bad.Attest, bad.Signature = f.ak.Quote(t, f.nonce, pcrs)
+	if err := AuthenticateEvidence(f.ak.ak, f.nonce, &bad); err != nil {
+		t.Fatalf("signed bad measurement: %v", err)
+	}
+
+	other := newSoftAK(t)
+	key := verifiertest.NewNodeKey(t)
+	vparsed := f.ak.ak
+	b := f.ak.BoundEvidence(t, f.nonce, key, f.ev.PCRs)
+	bound := &Evidence{Attest: b.Attest, Signature: b.Signature, PCRs: f.ev.PCRs,
+		NodeKey: &KeyEvidence{Public: b.Public, Certify: b.Certify, CertifySignature: b.CertifySignature}}
+	if err := AuthenticateEvidence(vparsed, f.nonce, bound); err != nil {
+		t.Fatalf("bound evidence: %v", err)
+	}
+
+	tests := []struct {
+		name  string
+		ak    *AK
+		nonce []byte
+		ev    *Evidence
+		want  Reason
+	}{
+		{"another AK", other.ak, f.nonce, f.ev, ReasonBadSignature},
+		{"another nonce", f.ak.ak, bytes.Repeat([]byte{1}, NonceSize), f.ev, ReasonNonceMismatch},
+		{"no nonce", f.ak.ak, nil, f.ev, ReasonNonceMismatch},
+		{"no evidence", f.ak.ak, f.nonce, nil, ReasonMalformed},
+		{"no signature", f.ak.ak, f.nonce, &Evidence{Attest: f.ev.Attest}, ReasonMalformed},
+		{"plain quote claiming a key", vparsed, f.nonce, &Evidence{Attest: b.Attest, Signature: b.Signature,
+			NodeKey: nil}, ReasonNonceMismatch},
+		{"bound quote, key swapped", vparsed, f.nonce, &Evidence{Attest: b.Attest, Signature: b.Signature,
+			NodeKey: &KeyEvidence{Public: verifiertest.NewNodeKey(t).PublicBytes()}}, ReasonNonceMismatch},
+		{"unparseable key", vparsed, f.nonce, &Evidence{Attest: b.Attest, Signature: b.Signature,
+			NodeKey: &KeyEvidence{Public: []byte{1}}}, ReasonKeyInvalid},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ReasonOf(AuthenticateEvidence(tc.ak, tc.nonce, tc.ev)); got != tc.want {
+				t.Fatalf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+	if err := AuthenticateEvidence(nil, f.nonce, f.ev); err == nil || ReasonOf(err) != "" {
+		t.Fatalf("nil AK: %v", err)
+	}
 }

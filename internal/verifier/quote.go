@@ -59,22 +59,9 @@ func VerifyQuote(ak *AK, nonce []byte, required []uint32, ev *Evidence) (*QuoteI
 	if len(required) == 0 {
 		return nil, fail(ReasonPCRSelection, "no PCRs required")
 	}
-	if len(ev.Attest) == 0 || len(ev.Attest) > MaxAttestSize ||
-		len(ev.Signature) == 0 || len(ev.Signature) > MaxSignatureSize {
-		return nil, fail(ReasonMalformed, "quote or signature size out of range")
-	}
-	if err := verifySignature(ak, ev.Attest, ev.Signature); err != nil {
-		return nil, err
-	}
-	attest, err := decode[tpm2.TPMSAttest](ev.Attest)
+	attest, err := authenticQuote(ak, nonce, ev)
 	if err != nil {
-		return nil, wrap(ReasonMalformed, err)
-	}
-	if attest.Magic != tpm2.TPMGeneratedValue || attest.Type != tpm2.TPMSTAttestQuote {
-		return nil, fail(ReasonNotQuote, "signed structure is not a TPM quote")
-	}
-	if len(nonce) == 0 || subtle.ConstantTimeCompare(attest.ExtraData.Buffer, nonce) != 1 {
-		return nil, fail(ReasonNonceMismatch, "quote is not bound to the challenge")
+		return nil, err
 	}
 	info, err := attest.Attested.Quote()
 	if err != nil {
@@ -109,6 +96,30 @@ func VerifyQuote(ak *AK, nonce []byte, required []uint32, ev *Evidence) (*QuoteI
 		Clock:           attest.ClockInfo.Clock,
 		FirmwareVersion: attest.FirmwareVersion,
 	}, nil
+}
+
+// authenticQuote checks that ev.Attest is a quote signed by ak over nonce:
+// that the AK's TPM produced it in answer to the challenge. It checks
+// nothing the quote attests to.
+func authenticQuote(ak *AK, nonce []byte, ev *Evidence) (*tpm2.TPMSAttest, error) {
+	if len(ev.Attest) == 0 || len(ev.Attest) > MaxAttestSize ||
+		len(ev.Signature) == 0 || len(ev.Signature) > MaxSignatureSize {
+		return nil, fail(ReasonMalformed, "quote or signature size out of range")
+	}
+	if err := verifySignature(ak, ev.Attest, ev.Signature); err != nil {
+		return nil, err
+	}
+	attest, err := decode[tpm2.TPMSAttest](ev.Attest)
+	if err != nil {
+		return nil, wrap(ReasonMalformed, err)
+	}
+	if attest.Magic != tpm2.TPMGeneratedValue || attest.Type != tpm2.TPMSTAttestQuote {
+		return nil, fail(ReasonNotQuote, "signed structure is not a TPM quote")
+	}
+	if len(nonce) == 0 || subtle.ConstantTimeCompare(attest.ExtraData.Buffer, nonce) != 1 {
+		return nil, fail(ReasonNonceMismatch, "quote is not bound to the challenge")
+	}
+	return attest, nil
 }
 
 func verifySignature(ak *AK, attest, sigBytes []byte) error {

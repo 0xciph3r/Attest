@@ -31,17 +31,9 @@ func VerifyEvidence(ak *AK, nonce []byte, pol *policy.Measurement, ev *Evidence)
 	if ev == nil {
 		return nil, fail(ReasonMalformed, "no evidence")
 	}
-	qualifying := nonce
-	var key *NodeKey
-	if ev.NodeKey != nil {
-		var err error
-		if key, err = ParseNodeKey(ev.NodeKey.Public); err != nil {
-			return nil, err
-		}
-		if len(nonce) == 0 {
-			return nil, fail(ReasonNonceMismatch, "no nonce")
-		}
-		qualifying = tpm.KeyBindingData(nonce, key.Name)
+	key, qualifying, err := qualifyingData(nonce, ev)
+	if err != nil {
+		return nil, err
 	}
 	q, err := VerifyQuote(ak, qualifying, pol.PCRs, ev)
 	if err != nil {
@@ -64,4 +56,38 @@ func VerifyEvidence(ak *AK, nonce []byte, pol *policy.Measurement, ev *Evidence)
 		return nil, wrap(ReasonMeasurement, err)
 	}
 	return &Result{Quote: q, Reference: ref, Events: len(events), NodeKey: key}, nil
+}
+
+// qualifyingData is what the quote must be bound to: the nonce, or, when
+// the evidence binds a node key, the nonce and the key's name.
+func qualifyingData(nonce []byte, ev *Evidence) (*NodeKey, []byte, error) {
+	if ev.NodeKey == nil {
+		return nil, nonce, nil
+	}
+	key, err := ParseNodeKey(ev.NodeKey.Public)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(nonce) == 0 {
+		return nil, nil, fail(ReasonNonceMismatch, "no nonce")
+	}
+	return key, tpm.KeyBindingData(nonce, key.Name), nil
+}
+
+// AuthenticateEvidence checks only that ev holds a quote signed by ak in
+// answer to nonce, so that a failure found later is attributable to the
+// node's TPM rather than to whoever sent the request.
+func AuthenticateEvidence(ak *AK, nonce []byte, ev *Evidence) error {
+	if ak == nil || ak.Key == nil {
+		return errors.New("verifier: no attestation key")
+	}
+	if ev == nil {
+		return fail(ReasonMalformed, "no evidence")
+	}
+	_, qualifying, err := qualifyingData(nonce, ev)
+	if err != nil {
+		return err
+	}
+	_, err = authenticQuote(ak, qualifying, ev)
+	return err
 }
