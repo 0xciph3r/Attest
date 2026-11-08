@@ -64,7 +64,7 @@ func (s *NodeServer) BeginEnrollment(ctx context.Context, req *attestv1.BeginEnr
 
 // CompleteEnrollment implements NodeService.
 func (s *NodeServer) CompleteEnrollment(ctx context.Context, req *attestv1.CompleteEnrollmentRequest) (*attestv1.CompleteEnrollmentResponse, error) {
-	if err := s.enroll.Complete(ctx, req.GetNodeId(), req.GetChallengeId(), req.GetSecret()); err != nil {
+	if err := s.enroll.Complete(ctx, req.GetNodeId(), req.GetChallengeId(), req.GetAkPublic(), req.GetSecret()); err != nil {
 		return nil, s.status(ctx, "CompleteEnrollment", err)
 	}
 	return &attestv1.CompleteEnrollmentResponse{}, nil

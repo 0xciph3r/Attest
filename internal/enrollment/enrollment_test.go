@@ -12,7 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"sync"
+	"strings"
 	"testing"
 	"time"
 
@@ -29,36 +29,13 @@ import (
 
 var ctx = context.Background()
 
-// recorder is a random source that remembers what it produced, so tests can
-// learn the credential secret without a TPM to activate it. The secret is the
-// first SecretSize bytes Begin reads.
-type recorder struct {
-	mu  sync.Mutex
-	buf []byte
-}
-
-func (r *recorder) Read(p []byte) (int, error) {
-	n, err := rand.Read(p)
-	r.mu.Lock()
-	r.buf = append(r.buf, p[:n]...)
-	r.mu.Unlock()
-	return n, err
-}
-
-func (r *recorder) reset() { r.mu.Lock(); r.buf = nil; r.mu.Unlock() }
-
-func (r *recorder) secret() []byte {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return bytes.Clone(r.buf[:SecretSize])
-}
-
 type env struct {
-	t    *testing.T
-	dir  string
-	st   *store.Store
-	svc  *Service
-	rng  *recorder
+	t   *testing.T
+	dir string
+	st  *store.Store
+	svc *Service
+	// aks remembers the AK each challenge was begun for.
+	aks  map[string]*verifiertest.AK
 	now  time.Time
 	prod *swtpmtest.CA
 	dev  *swtpmtest.CA
@@ -72,14 +49,14 @@ func newEnv(t *testing.T) *env {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
-	e := &env{t: t, st: st, dir: dir, rng: &recorder{}, now: time.Now(),
+	e := &env{t: t, st: st, dir: dir, aks: map[string]*verifiertest.AK{}, now: time.Now(),
 		prod: swtpmtest.NewCA(t, "Production EK CA"), dev: swtpmtest.NewCA(t, "swtpm-localca")}
 	prod, dev := x509.NewCertPool(), x509.NewCertPool()
 	prod.AddCert(e.prod.Cert)
 	dev.AddCert(e.dev.Cert)
 	e.svc, err = New(Config{
 		Store: st, Roots: verifier.EKRoots{Production: prod, Development: dev},
-		Now: func() time.Time { return e.now }, Rand: e.rng,
+		Now: func() time.Time { return e.now },
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -113,15 +90,27 @@ func ekCert(t *testing.T, ca *swtpmtest.CA) []byte {
 	return ca.IssueEKCert(t, &key.PublicKey)
 }
 
-// begin starts enrollment and returns the challenge and its secret.
+// begin starts enrollment and returns the challenge and the secret its TPM
+// would recover.
 func (e *env) begin(nodeID string, ak *verifiertest.AK) (*Challenge, []byte) {
 	e.t.Helper()
-	e.rng.reset()
 	ch, err := e.svc.Begin(ctx, nodeID, ak.PublicBytes())
 	if err != nil {
 		e.t.Fatalf("Begin: %v", err)
 	}
-	return ch, e.rng.secret()
+	e.aks[ch.ID] = ak
+	return ch, e.svc.secret(nodeID, ch.ID, ak.Name)
+}
+
+// complete answers challenge id with the AK it was begun for.
+func (e *env) complete(nodeID, id string, secret []byte) error {
+	var akPublic []byte
+	if ak := e.aks[id]; ak != nil {
+		akPublic = ak.PublicBytes()
+	} else {
+		akPublic = verifiertest.NewAK(e.t).PublicBytes()
+	}
+	return e.svc.Complete(ctx, nodeID, id, akPublic, secret)
 }
 
 func (e *env) enroll(nodeID string, ca *swtpmtest.CA) *verifiertest.AK {
@@ -131,7 +120,7 @@ func (e *env) enroll(nodeID string, ca *swtpmtest.CA) *verifiertest.AK {
 	}
 	ak := verifiertest.NewAK(e.t)
 	ch, secret := e.begin(nodeID, ak)
-	if err := e.svc.Complete(ctx, nodeID, ch.ID, secret); err != nil {
+	if err := e.complete(nodeID, ch.ID, secret); err != nil {
 		e.t.Fatalf("Complete: %v", err)
 	}
 	return ak
@@ -170,7 +159,7 @@ func TestEnroll(t *testing.T) {
 	if n.State != store.NodeEnrolled || !bytes.Equal(n.AKName, ak.Name) || n.EKDevelopment {
 		t.Fatalf("got %+v", n)
 	}
-	want := []string{ActionRegister, ActionEnrollBegin, ActionEnroll}
+	want := []string{ActionRegister, ActionEnroll}
 	if got := e.auditActions(); !slices.Equal(got, want) {
 		t.Fatalf("audit %v, want %v", got, want)
 	}
@@ -195,12 +184,12 @@ func TestEnrollDevelopmentRoot(t *testing.T) {
 	ak := verifiertest.NewAK(t)
 	ch, secret := e.begin("dev-1", ak)
 	e.applyPolicy(false)
-	wantReason(t, e.svc.Complete(ctx, "dev-1", ch.ID, secret), verifier.ReasonDevelopmentRoot)
+	wantReason(t, e.complete("dev-1", ch.ID, secret), verifier.ReasonDevelopmentRoot)
 	e.applyPolicy(true)
-	wantReason(t, e.svc.Complete(ctx, "dev-1", ch.ID, secret), verifier.ReasonChallengeConsumed)
+	wantReason(t, e.complete("dev-1", ch.ID, secret), verifier.ReasonChallengeConsumed)
 
 	ch, secret = e.begin("dev-1", ak)
-	if err := e.svc.Complete(ctx, "dev-1", ch.ID, secret); err != nil {
+	if err := e.complete("dev-1", ch.ID, secret); err != nil {
 		t.Fatal(err)
 	}
 	if n, _ := e.st.Node(ctx, "dev-1"); !n.EKDevelopment {
@@ -232,36 +221,49 @@ func TestRegisterRejects(t *testing.T) {
 	}
 }
 
+// Begin is unauthenticated, so its refusals are not recorded.
 func TestBeginRejects(t *testing.T) {
 	e := newEnv(t)
 	ak := verifiertest.NewAK(t)
 
-	_, err := e.svc.Begin(ctx, "ghost", ak.PublicBytes())
-	wantReason(t, err, verifier.ReasonNodeUnknown)
-
+	e.unchanged("unknown node", func() error {
+		_, err := e.svc.Begin(ctx, "ghost", ak.PublicBytes())
+		wantReason(t, err, verifier.ReasonNodeUnknown)
+		return err
+	})
 	if _, err := e.svc.Register(ctx, "operator:alice", "node-1", ekCert(t, e.prod)); err != nil {
 		t.Fatal(err)
 	}
-	_, err = e.svc.Begin(ctx, "node-1", append(ak.PublicBytes(), 0))
-	wantReason(t, err, verifier.ReasonAKInvalid)
+	e.unchanged("trailing byte", func() error {
+		_, err := e.svc.Begin(ctx, "node-1", append(ak.PublicBytes(), 0))
+		wantReason(t, err, verifier.ReasonAKInvalid)
+		return err
+	})
 	weak := ak.Public
 	weak.ObjectAttributes.Restricted = false
-	_, err = e.svc.Begin(ctx, "node-1", tpm2.Marshal(weak))
-	wantReason(t, err, verifier.ReasonAKInvalid)
-
+	e.unchanged("unrestricted AK", func() error {
+		_, err := e.svc.Begin(ctx, "node-1", tpm2.Marshal(weak))
+		wantReason(t, err, verifier.ReasonAKInvalid)
+		return err
+	})
+	e.unchanged("oversized AK", func() error {
+		_, err := e.svc.Begin(ctx, "node-1", make([]byte, MaxAKSize+1))
+		wantReason(t, err, verifier.ReasonAKInvalid)
+		return err
+	})
 	e.enroll("node-2", e.prod)
-	_, err = e.svc.Begin(ctx, "node-2", ak.PublicBytes())
-	wantReason(t, err, verifier.ReasonNodeState)
-
-	got := e.auditActions()
-	denied := 0
-	for _, a := range got {
-		if a == ActionEnrollDenied {
-			denied++
-		}
-	}
-	if denied != 4 {
-		t.Fatalf("denials not audited: %v", got)
+	e.unchanged("enrolled node", func() error {
+		_, err := e.svc.Begin(ctx, "node-2", ak.PublicBytes())
+		wantReason(t, err, verifier.ReasonNodeState)
+		return err
+	})
+	e.unchanged("successful begin", func() error {
+		e.begin("node-1", ak)
+		return errors.New("ok")
+	})
+	want := []string{ActionRegister, ActionRegister, ActionEnroll}
+	if got := e.auditActions(); !slices.Equal(got, want) {
+		t.Fatalf("audit %v, want %v", got, want)
 	}
 }
 
@@ -272,38 +274,101 @@ func TestCompleteRejects(t *testing.T) {
 	}
 	ak := verifiertest.NewAK(t)
 
-	t.Run("wrong secret burns the challenge", func(t *testing.T) {
-		ch, secret := e.begin("node-1", ak)
+	// Until the secret matches, the caller could be anyone: refusals leave
+	// the challenge usable and record nothing.
+	t.Run("wrong secret", func(t *testing.T) {
+		if _, err := e.svc.Register(ctx, "operator:alice", "node-w", ekCert(t, e.prod)); err != nil {
+			t.Fatal(err)
+		}
+		ch, secret := e.begin("node-w", ak)
 		wrong := bytes.Clone(secret)
 		wrong[0] ^= 1
-		wantReason(t, e.svc.Complete(ctx, "node-1", ch.ID, wrong), verifier.ReasonActivationFailed)
-		wantReason(t, e.svc.Complete(ctx, "node-1", ch.ID, secret), verifier.ReasonChallengeConsumed)
+		e.unchanged("wrong secret", func() error {
+			err := e.complete("node-w", ch.ID, wrong)
+			wantReason(t, err, verifier.ReasonActivationFailed)
+			return err
+		})
+		if err := e.complete("node-w", ch.ID, secret); err != nil {
+			t.Fatalf("challenge burned by a wrong guess: %v", err)
+		}
 	})
 	t.Run("short secret", func(t *testing.T) {
 		ch, secret := e.begin("node-1", ak)
-		wantReason(t, e.svc.Complete(ctx, "node-1", ch.ID, secret[:16]), verifier.ReasonActivationFailed)
+		e.unchanged("short secret", func() error {
+			err := e.complete("node-1", ch.ID, secret[:16])
+			wantReason(t, err, verifier.ReasonActivationFailed)
+			return err
+		})
 	})
 	t.Run("expired", func(t *testing.T) {
 		ch, secret := e.begin("node-1", ak)
 		e.now = e.now.Add(DefaultChallengeTTL)
 		defer func() { e.now = e.now.Add(-DefaultChallengeTTL) }()
-		wantReason(t, e.svc.Complete(ctx, "node-1", ch.ID, secret), verifier.ReasonChallengeExpired)
+		e.unchanged("expired", func() error {
+			err := e.complete("node-1", ch.ID, secret)
+			wantReason(t, err, verifier.ReasonChallengeExpired)
+			return err
+		})
 	})
 	t.Run("wrong node", func(t *testing.T) {
 		if _, err := e.svc.Register(ctx, "operator:alice", "node-x", ekCert(t, e.prod)); err != nil {
 			t.Fatal(err)
 		}
 		ch, secret := e.begin("node-1", ak)
-		wantReason(t, e.svc.Complete(ctx, "node-x", ch.ID, secret), verifier.ReasonChallengeWrongNode)
-		wantReason(t, e.svc.Complete(ctx, "node-1", ch.ID, secret), verifier.ReasonChallengeConsumed)
+		e.unchanged("wrong node", func() error {
+			err := e.complete("node-x", ch.ID, secret)
+			wantReason(t, err, verifier.ReasonActivationFailed)
+			return err
+		})
 	})
-	t.Run("unknown challenge", func(t *testing.T) {
-		wantReason(t, e.svc.Complete(ctx, "node-1", "enr_00000000000000000000000000000000", make([]byte, 32)),
-			verifier.ReasonChallengeUnknown)
-		if err := e.svc.Complete(ctx, "node-1", "../etc", nil); !errors.Is(err, ErrInvalidChallengeID) {
+	t.Run("AK substituted", func(t *testing.T) {
+		ch, secret := e.begin("node-1", ak)
+		e.unchanged("AK substituted", func() error {
+			err := e.svc.Complete(ctx, "node-1", ch.ID, verifiertest.NewAK(t).PublicBytes(), secret)
+			wantReason(t, err, verifier.ReasonActivationFailed)
+			return err
+		})
+		for name, pub := range map[string][]byte{
+			"missing":   nil,
+			"oversized": make([]byte, MaxAKSize+1),
+			"trailing":  append(ak.PublicBytes(), 0),
+		} {
+			e.unchanged("AK "+name, func() error {
+				err := e.svc.Complete(ctx, "node-1", ch.ID, pub, secret)
+				wantReason(t, err, verifier.ReasonAKInvalid)
+				return err
+			})
+		}
+	})
+	t.Run("forged challenge", func(t *testing.T) {
+		ch, secret := e.begin("node-1", ak)
+		// Pushing the expiry out changes the ID and so the secret.
+		later := ch.ID[:len(ch.ID)-16] + "7fffffffffffffff"
+		e.aks[later] = ak
+		for _, id := range []string{"enr_" + strings.Repeat("0", 48), later} {
+			e.unchanged("forged "+id, func() error {
+				err := e.complete("node-1", id, secret)
+				wantReason(t, err, verifier.ReasonActivationFailed)
+				return err
+			})
+		}
+		if err := e.complete("node-1", "../etc", nil); !errors.Is(err, ErrInvalidChallengeID) {
 			t.Fatal(err)
 		}
 	})
+	t.Run("challenge from before a restart", func(t *testing.T) {
+		ch, secret := e.begin("node-1", ak)
+		restarted, err := New(Config{Store: e.st, Roots: e.svc.roots, Now: e.svc.now})
+		if err != nil {
+			t.Fatal(err)
+		}
+		e.unchanged("after restart", func() error {
+			err := restarted.Complete(ctx, "node-1", ch.ID, ak.PublicBytes(), secret)
+			wantReason(t, err, verifier.ReasonActivationFailed)
+			return err
+		})
+	})
+	// Failures after the secret matches are the node's own and recorded.
 	t.Run("revoked before completion", func(t *testing.T) {
 		if _, err := e.svc.Register(ctx, "operator:alice", "node-r", ekCert(t, e.prod)); err != nil {
 			t.Fatal(err)
@@ -312,7 +377,7 @@ func TestCompleteRejects(t *testing.T) {
 		if err := e.svc.Revoke(ctx, "operator:alice", "node-r"); err != nil {
 			t.Fatal(err)
 		}
-		wantReason(t, e.svc.Complete(ctx, "node-r", ch.ID, secret), verifier.ReasonNodeState)
+		wantReason(t, e.complete("node-r", ch.ID, secret), verifier.ReasonNodeState)
 	})
 	t.Run("EK certificate expired since registration", func(t *testing.T) {
 		if _, err := e.svc.Register(ctx, "operator:alice", "node-e", ekCert(t, e.prod)); err != nil {
@@ -323,7 +388,7 @@ func TestCompleteRejects(t *testing.T) {
 		defer func() { e.now, e.svc.ttl = saved, DefaultChallengeTTL }()
 		ch, secret := e.begin("node-e", verifiertest.NewAK(t))
 		e.now = e.now.AddDate(30, 0, 0)
-		wantReason(t, e.svc.Complete(ctx, "node-e", ch.ID, secret), verifier.ReasonEKUntrusted)
+		wantReason(t, e.complete("node-e", ch.ID, secret), verifier.ReasonEKUntrusted)
 	})
 	t.Run("AK already enrolled for another node", func(t *testing.T) {
 		shared := e.enroll("node-a", e.prod)
@@ -331,16 +396,30 @@ func TestCompleteRejects(t *testing.T) {
 			t.Fatal(err)
 		}
 		ch, secret := e.begin("node-b", shared)
-		wantReason(t, e.svc.Complete(ctx, "node-b", ch.ID, secret), verifier.ReasonAKInUse)
+		wantReason(t, e.complete("node-b", ch.ID, secret), verifier.ReasonAKInUse)
 		if n, _ := e.st.Node(ctx, "node-b"); n.State != store.NodeRegistered {
 			t.Fatalf("node-b is %s", n.State)
 		}
+		e.unchanged("replay", func() error {
+			err := e.complete("node-b", ch.ID, secret)
+			wantReason(t, err, verifier.ReasonChallengeConsumed)
+			return err
+		})
 	})
 
 	if n, _ := e.st.Node(ctx, "node-1"); n.State != store.NodeRegistered {
 		t.Fatalf("failed attempts changed node state to %s", n.State)
 	}
-	e.auditActions()
+	denied := 0
+	for _, a := range e.auditActions() {
+		if a == ActionEnrollDenied {
+			denied++
+		}
+	}
+	// revoked, EK expired and AK in use.
+	if denied != 3 {
+		t.Fatalf("%d denials audited, want 3", denied)
+	}
 }
 
 // The credential secret is never persisted; only its hash is.
@@ -350,7 +429,7 @@ func TestSecretNotStored(t *testing.T) {
 		t.Fatal(err)
 	}
 	ch, secret := e.begin("node-1", verifiertest.NewAK(t))
-	if err := e.svc.Complete(ctx, "node-1", ch.ID, secret); err != nil {
+	if err := e.complete("node-1", ch.ID, secret); err != nil {
 		t.Fatal(err)
 	}
 	h := sha256.Sum256(secret)

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -72,9 +73,21 @@ func TestRefusedCallsLeaveNoState(t *testing.T) {
 		_, err := e.svc.Register(ctx, "operator:alice", "node-2", ekCert(t, e.dev))
 		return err
 	})
-	for _, n := range []int{0, 1, SecretSize - 1, SecretSize, SecretSize + 15} {
-		svc, _ := New(Config{Store: e.st, Roots: e.svc.roots, Now: e.svc.now, Rand: &failingRand{n}})
-		e.unchanged("begin with failing RNG", func() error { _, err := svc.Begin(ctx, "node-1", ak.PublicBytes()); return err })
+	for _, n := range []int{0, 1, sha256.Size - 1} {
+		if _, err := New(Config{Store: e.st, Rand: &failingRand{n}}); err == nil {
+			t.Errorf("New with %d bytes of entropy succeeded", n)
+		}
+	}
+	// The key takes 32 bytes, then the challenge ID 16. (CreateCredential's
+	// ephemeral key comes from the system source whatever reader it is given.)
+	for _, n := range []int{32, 32 + 15} {
+		svc, err := New(Config{Store: e.st, Roots: e.svc.roots, Now: e.svc.now, Rand: &failingRand{n}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := svc.Begin(ctx, "node-1", ak.PublicBytes()); err == nil {
+			t.Errorf("Begin with %d bytes of entropy succeeded", n)
+		}
 	}
 	for _, id := range []string{"", "Node-1", "node-1 ", "../node-1", string(bytes.Repeat([]byte("a"), 65))} {
 		e.unchanged("register node ID "+id, func() error {
@@ -83,13 +96,17 @@ func TestRefusedCallsLeaveNoState(t *testing.T) {
 		})
 		e.unchanged("begin node ID "+id, func() error { _, err := e.svc.Begin(ctx, id, ak.PublicBytes()); return err })
 		e.unchanged("complete node ID "+id, func() error {
-			return e.svc.Complete(ctx, id, "enr_00000000000000000000000000000000", make([]byte, SecretSize))
+			return e.svc.Complete(ctx, id, "enr_"+strings.Repeat("0", 48), ak.PublicBytes(), make([]byte, SecretSize))
 		})
 		e.unchanged("revoke node ID "+id, func() error { return e.svc.Revoke(ctx, "operator:alice", id) })
 	}
-	for _, id := range []string{"", "enr_", "enr_" + string(bytes.Repeat([]byte("A"), 32)), "att_00000000000000000000000000000000"} {
+	for _, id := range []string{"", "enr_", "enr_" + strings.Repeat("A", 48), "enr_" + strings.Repeat("0", 32),
+		"enr_" + strings.Repeat("0", 49), "att_" + strings.Repeat("0", 48)} {
 		e.unchanged("complete challenge ID "+id, func() error {
-			return e.svc.Complete(ctx, "node-1", id, make([]byte, SecretSize))
+			if err := e.svc.Complete(ctx, "node-1", id, ak.PublicBytes(), make([]byte, SecretSize)); !errors.Is(err, ErrInvalidChallengeID) {
+				t.Errorf("challenge ID %q: %v", id, err)
+			}
+			return ErrInvalidChallengeID
 		})
 	}
 	e.unchanged("revoke unknown node", func() error { return e.svc.Revoke(ctx, "operator:alice", "ghost") })
@@ -97,7 +114,7 @@ func TestRefusedCallsLeaveNoState(t *testing.T) {
 
 	// node-1 is still registered and can enroll.
 	ch, secret := e.begin("node-1", ak)
-	if err := e.svc.Complete(ctx, "node-1", ch.ID, secret); err != nil {
+	if err := e.complete("node-1", ch.ID, secret); err != nil {
 		t.Fatal(err)
 	}
 	if err := e.svc.Revoke(ctx, "operator:alice", "node-1"); err != nil {
@@ -126,12 +143,11 @@ func TestCompleteRejectsMore(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			ch, own := e.begin("node-1", ak)
 			_, other := e.begin("node-1", ak)
-			wantReason(t, e.svc.Complete(ctx, "node-1", ch.ID, tc.secret(own, other)), tc.want)
-			// The challenge is burned even for the right secret.
-			wantReason(t, e.svc.Complete(ctx, "node-1", ch.ID, own), verifier.ReasonChallengeConsumed)
-			if n, _ := e.st.Node(ctx, "node-1"); n.State != store.NodeRegistered {
-				t.Fatalf("node %s after failed completion", n.State)
-			}
+			e.unchanged(name, func() error {
+				err := e.complete("node-1", ch.ID, tc.secret(own, other))
+				wantReason(t, err, tc.want)
+				return err
+			})
 		})
 	}
 }
@@ -146,10 +162,10 @@ func TestSecondChallengeCannotReplaceAK(t *testing.T) {
 	ak1, ak2 := verifiertest.NewAK(t), verifiertest.NewAK(t)
 	ch1, s1 := e.begin("node-1", ak1)
 	ch2, s2 := e.begin("node-1", ak2)
-	if err := e.svc.Complete(ctx, "node-1", ch1.ID, s1); err != nil {
+	if err := e.complete("node-1", ch1.ID, s1); err != nil {
 		t.Fatal(err)
 	}
-	wantReason(t, e.svc.Complete(ctx, "node-1", ch2.ID, s2), verifier.ReasonNodeState)
+	wantReason(t, e.complete("node-1", ch2.ID, s2), verifier.ReasonNodeState)
 	n, _ := e.st.Node(ctx, "node-1")
 	if !bytes.Equal(n.AKName, ak1.Name) {
 		t.Fatal("second challenge replaced the enrolled AK")
@@ -166,7 +182,7 @@ func TestConcurrentCompletion(t *testing.T) {
 	errs := make(chan error, n)
 	var wg sync.WaitGroup
 	for range n {
-		wg.Go(func() { errs <- e.svc.Complete(ctx, "node-1", ch.ID, secret) })
+		wg.Go(func() { errs <- e.complete("node-1", ch.ID, secret) })
 	}
 	wg.Wait()
 	close(errs)
@@ -194,7 +210,7 @@ func TestReRegisterAfterRevoke(t *testing.T) {
 	}
 	ak := verifiertest.NewAK(t)
 	ch, s := e.begin("node-1", ak)
-	if err := e.svc.Complete(ctx, "node-1", ch.ID, s); err != nil {
+	if err := e.complete("node-1", ch.ID, s); err != nil {
 		t.Fatal(err)
 	}
 	if err := e.svc.Revoke(ctx, "operator:alice", "node-1"); err != nil {
@@ -211,7 +227,7 @@ func TestReRegisterAfterRevoke(t *testing.T) {
 	// The revoked AK may be enrolled again for the new record, since the
 	// old record can no longer attest.
 	ch, s = e.begin("node-1b", ak)
-	if err := e.svc.Complete(ctx, "node-1b", ch.ID, s); err != nil {
+	if err := e.complete("node-1b", ch.ID, s); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -226,11 +242,11 @@ func TestCompleteTTLBoundary(t *testing.T) {
 	start := e.now
 	ch, s := e.begin("node-1", ak)
 	e.now = ch.ExpiresAt
-	wantReason(t, e.svc.Complete(ctx, "node-1", ch.ID, s), verifier.ReasonChallengeExpired)
+	wantReason(t, e.complete("node-1", ch.ID, s), verifier.ReasonChallengeExpired)
 	e.now = start
 	ch, s = e.begin("node-1", ak)
 	e.now = ch.ExpiresAt.Add(-time.Nanosecond)
-	if err := e.svc.Complete(ctx, "node-1", ch.ID, s); err != nil {
+	if err := e.complete("node-1", ch.ID, s); err != nil {
 		t.Fatalf("just before expiry: %v", err)
 	}
 }

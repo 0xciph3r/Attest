@@ -322,10 +322,11 @@ func TestEnrollmentRejects(t *testing.T) {
 	expectCode(t, "empty node ID", err, codes.InvalidArgument, "")
 	_, err = c.CompleteEnrollment(bg, &attestv1.CompleteEnrollmentRequest{NodeId: "n1", ChallengeId: "x"})
 	expectCode(t, "malformed challenge", err, codes.InvalidArgument, "")
-	_, err = c.CompleteEnrollment(bg, &attestv1.CompleteEnrollmentRequest{NodeId: "n1", ChallengeId: "enr_" + strings.Repeat("a", 32)})
-	if status.Code(err) != codes.PermissionDenied {
-		t.Errorf("unknown challenge: %v", err)
-	}
+	_, err = c.CompleteEnrollment(bg, &attestv1.CompleteEnrollmentRequest{NodeId: "n1", ChallengeId: "enr_" + strings.Repeat("a", 48),
+		AkPublic: ak.PublicBytes(), Secret: make([]byte, 32)})
+	expectCode(t, "forged challenge", err, codes.PermissionDenied, "activation_failed")
+	_, err = c.CompleteEnrollment(bg, &attestv1.CompleteEnrollmentRequest{NodeId: "n1", ChallengeId: "enr_" + strings.Repeat("a", 48)})
+	expectCode(t, "no AK", err, codes.PermissionDenied, "ak_invalid")
 }
 
 func TestIssueWorkloadRejects(t *testing.T) {

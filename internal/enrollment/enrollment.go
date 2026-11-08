@@ -7,9 +7,11 @@ package enrollment
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -39,7 +41,6 @@ const DefaultChallengeTTL = 2 * time.Minute
 // Audit actions.
 const (
 	ActionRegister     = "node.register"
-	ActionEnrollBegin  = "node.enroll.begin"
 	ActionEnroll       = "node.enroll"
 	ActionEnrollDenied = "node.enroll.denied"
 	ActionRevoke       = "node.revoke"
@@ -51,7 +52,9 @@ var ErrInvalidNodeID = errors.New("enrollment: node ID must match " + policy.Nod
 // ErrInvalidChallengeID is returned for malformed challenge IDs.
 var ErrInvalidChallengeID = errors.New("enrollment: malformed challenge ID")
 
-var challengeIDRe = regexp.MustCompile(`^enr_[0-9a-f]{32}$`)
+// A challenge ID is 16 random bytes and the big-endian expiry in Unix
+// nanoseconds.
+var challengeIDRe = regexp.MustCompile(`^enr_[0-9a-f]{48}$`)
 
 // Config configures a Service.
 type Config struct {
@@ -66,12 +69,19 @@ type Config struct {
 }
 
 // Service implements node registration, enrollment and revocation.
+//
+// Enrollment challenges are stateless: the activation secret is a MAC, under
+// a key held only in memory, of the node, the challenge ID (which carries the
+// expiry) and the AK name. Beginning enrollment writes nothing, and a restart
+// invalidates every outstanding challenge. A challenge is stored only when a
+// node proves it recovered the secret, which is what makes it single-use.
 type Service struct {
 	st    *store.Store
 	roots verifier.EKRoots
 	ttl   time.Duration
 	now   func() time.Time
 	rand  io.Reader
+	key   []byte
 }
 
 // New returns an enrollment service.
@@ -88,6 +98,10 @@ func New(cfg Config) (*Service, error) {
 	}
 	if s.rand == nil {
 		s.rand = rand.Reader
+	}
+	s.key = make([]byte, sha256.Size)
+	if _, err := io.ReadFull(s.rand, s.key); err != nil {
+		return nil, fmt.Errorf("enrollment: generating challenge key: %w", err)
 	}
 	return s, nil
 }
@@ -116,14 +130,8 @@ func (s *Service) Register(ctx context.Context, actor, nodeID string, ekCert []b
 		RegisteredBy: actor, RegisteredAt: now,
 	}
 	err = s.st.Update(ctx, func(tx *store.Tx) error {
-		if ek.Development {
-			m, _, err := verifier.CurrentPolicy(tx)
-			if err != nil {
-				return err
-			}
-			if err := verifier.AdmitRoot(true, m); err != nil {
-				return err
-			}
+		if err := admitRoot(ek, txPolicy(tx)); err != nil {
+			return err
 		}
 		if err := tx.InsertNode(n); err != nil {
 			return err
@@ -150,50 +158,23 @@ type Challenge struct {
 // is encrypted to the EK derived from the registered certificate and bound to
 // the AK name computed here, so only the approved TPM holding that AK can
 // recover it. Nothing the node supplies about its EK is trusted.
+//
+// Begin writes nothing, the audit ledger included: the caller is not
+// authenticated.
 func (s *Service) Begin(ctx context.Context, nodeID string, akPublic []byte) (*Challenge, error) {
 	if !policy.ValidNodeID(nodeID) {
 		return nil, ErrInvalidNodeID
 	}
 	now := s.now()
-	actor := "node:" + nodeID
-	var ch *Challenge
-	var denial error
-	err := s.st.Update(ctx, func(tx *store.Tx) error {
-		c, err := s.begin(tx, now, nodeID, akPublic)
-		if verifier.ReasonOf(err) == "" {
-			if err != nil {
-				return err
-			}
-			ch = c
-			return appendAudit(tx, now, actor, ActionEnrollBegin, nodeID, map[string]any{"challenge": c.ID})
-		}
-		denial = err
-		return appendAudit(tx, now, actor, ActionEnrollDenied, nodeID, map[string]any{
-			"stage": "begin", "reason": verifier.ReasonOf(err),
-		})
-	})
+	n, err := registeredNode(s.st.Node(ctx, nodeID))
 	if err != nil {
 		return nil, err
 	}
-	if denial != nil {
-		return nil, denial
-	}
-	return ch, nil
-}
-
-func (s *Service) begin(tx *store.Tx, now time.Time, nodeID string, akPublic []byte) (*Challenge, error) {
-	n, err := registeredNode(tx, nodeID, store.NodeRegistered)
+	ak, err := parseAK(akPublic)
 	if err != nil {
 		return nil, err
 	}
-	if len(akPublic) > MaxAKSize {
-		return nil, verifier.Reject(verifier.ReasonAKInvalid, "AK public area exceeds %d bytes", MaxAKSize)
-	}
-	ak, err := verifier.ParseAK(akPublic)
-	if err != nil {
-		return nil, err
-	}
-	ek, err := s.reverifyEK(tx, n, now)
+	ek, err := s.reverifyEK(n, now, storePolicy(ctx, s.st))
 	if err != nil {
 		return nil, err
 	}
@@ -201,33 +182,44 @@ func (s *Service) begin(tx *store.Tx, now time.Time, nodeID string, akPublic []b
 	if err != nil {
 		return nil, fmt.Errorf("enrollment: EK encapsulation key: %w", err)
 	}
-	secret := make([]byte, SecretSize)
-	if _, err := io.ReadFull(s.rand, secret); err != nil {
-		return nil, fmt.Errorf("enrollment: generating secret: %w", err)
+	var b [24]byte
+	if _, err := io.ReadFull(s.rand, b[:16]); err != nil {
+		return nil, fmt.Errorf("enrollment: generating challenge: %w", err)
 	}
-	blob, enc, err := tpm2.CreateCredential(s.rand, kem, ak.Name, secret)
+	expires := now.Add(s.ttl).Round(0)
+	binary.BigEndian.PutUint64(b[16:], uint64(expires.UnixNano())) //nolint:gosec // after 1970
+	id := "enr_" + hex.EncodeToString(b[:])
+	blob, enc, err := tpm2.CreateCredential(s.rand, kem, ak.Name, s.secret(nodeID, id, ak.Name))
 	if err != nil {
 		return nil, fmt.Errorf("enrollment: creating credential: %w", err)
 	}
-	id, err := newID(s.rand, "enr_")
-	if err != nil {
-		return nil, err
-	}
-	hash := sha256.Sum256(secret)
-	c := &store.EnrollmentChallenge{
-		ID: id, NodeID: nodeID, AKPublic: akPublic, AKName: ak.Name, SecretHash: hash[:],
-		IssuedAt: now, ExpiresAt: now.Add(s.ttl),
-	}
-	if err := tx.InsertEnrollmentChallenge(c); err != nil {
-		return nil, err
-	}
-	return &Challenge{ID: id, CredentialBlob: blob, EncryptedSecret: enc, ExpiresAt: c.ExpiresAt}, nil
+	return &Challenge{ID: id, CredentialBlob: blob, EncryptedSecret: enc, ExpiresAt: time.Unix(0, expires.UnixNano())}, nil
 }
 
-// Complete finishes enrollment with the secret the node's TPM recovered. A
-// challenge admits exactly one attempt: it is consumed whatever the outcome,
-// and the outcome is audited in the same transaction.
-func (s *Service) Complete(ctx context.Context, nodeID, challengeID string, secret []byte) error {
+// secret derives the activation secret of challenge id for nodeID's AK.
+func (s *Service) secret(nodeID, id string, akName []byte) []byte {
+	m := hmac.New(sha256.New, s.key)
+	// Node IDs and challenge IDs contain no NUL; the AK name comes last.
+	m.Write([]byte("attest/v1/enrollment-secret\x00" + nodeID + "\x00" + id + "\x00"))
+	m.Write(akName)
+	return m.Sum(nil)
+}
+
+// challengeExpiry reads the expiry from a well-formed challenge ID.
+func challengeExpiry(id string) time.Time {
+	b, _ := hex.DecodeString(id[len(id)-16:])
+	return time.Unix(0, int64(binary.BigEndian.Uint64(b))) //nolint:gosec // round-trips Begin
+}
+
+// Complete finishes enrollment with the secret the node's TPM recovered for
+// akPublic.
+//
+// Until the secret is shown to match, the caller could be anyone, so a
+// wrong secret, an expired challenge or a malformed request is refused
+// without writing anything. A correct secret consumes the challenge, and the
+// outcome, enrolled or denied, is audited in the same transaction. A
+// challenge already consumed is refused without a record.
+func (s *Service) Complete(ctx context.Context, nodeID, challengeID string, akPublic, secret []byte) error {
 	if !policy.ValidNodeID(nodeID) {
 		return ErrInvalidNodeID
 	}
@@ -235,26 +227,44 @@ func (s *Service) Complete(ctx context.Context, nodeID, challengeID string, secr
 		return ErrInvalidChallengeID
 	}
 	now := s.now()
+	ak, err := parseAK(akPublic)
+	if err != nil {
+		return err
+	}
+	// A challenge issued to another node or AK has a different secret.
+	if subtle.ConstantTimeCompare(secret, s.secret(nodeID, challengeID, ak.Name)) != 1 {
+		return verifier.Reject(verifier.ReasonActivationFailed, "recovered secret does not match")
+	}
+	expires := challengeExpiry(challengeID)
+	if !now.Before(expires) {
+		return verifier.Reject(verifier.ReasonChallengeExpired, "challenge expired at %s", expires)
+	}
+
 	actor := "node:" + nodeID
 	var denial error
-	err := s.st.Update(ctx, func(tx *store.Tx) error {
-		ch, err := tx.EnrollmentChallenge(challengeID)
-		switch {
-		case errors.Is(err, store.ErrNotFound):
-			denial = verifier.Reject(verifier.ReasonChallengeUnknown, "no such enrollment challenge")
-		case err != nil:
-			return err
-		case !ch.ConsumedAt.IsZero():
+	err = s.st.Update(ctx, func(tx *store.Tx) error {
+		switch _, err := tx.EnrollmentChallenge(challengeID); {
+		case err == nil:
 			denial = verifier.Reject(verifier.ReasonChallengeConsumed, "enrollment challenge already used")
-		default:
-			if err := s.complete(tx, now, nodeID, ch, secret); verifier.ReasonOf(err) != "" {
-				denial = err
-			} else if err != nil {
-				return err
-			}
-			if err := tx.ConsumeEnrollmentChallenge(ch.ID, now, denial == nil); err != nil {
-				return err
-			}
+			return nil
+		case !errors.Is(err, store.ErrNotFound):
+			return err
+		}
+		hash := sha256.Sum256(secret)
+		ch := &store.EnrollmentChallenge{
+			ID: challengeID, NodeID: nodeID, AKPublic: akPublic, AKName: ak.Name, SecretHash: hash[:],
+			IssuedAt: expires.Add(-s.ttl), ExpiresAt: expires,
+		}
+		if err := tx.InsertEnrollmentChallenge(ch); err != nil {
+			return err
+		}
+		if err := s.complete(tx, now, ch); verifier.ReasonOf(err) != "" {
+			denial = err
+		} else if err != nil {
+			return err
+		}
+		if err := tx.ConsumeEnrollmentChallenge(ch.ID, now, denial == nil); err != nil {
+			return err
 		}
 		if denial == nil {
 			return appendAudit(tx, now, actor, ActionEnroll, nodeID, map[string]any{
@@ -262,7 +272,7 @@ func (s *Service) Complete(ctx context.Context, nodeID, challengeID string, secr
 			})
 		}
 		return appendAudit(tx, now, actor, ActionEnrollDenied, nodeID, map[string]any{
-			"stage": "complete", "challenge": challengeID, "reason": verifier.ReasonOf(denial),
+			"challenge": challengeID, "reason": verifier.ReasonOf(denial),
 		})
 	})
 	if err != nil {
@@ -271,31 +281,29 @@ func (s *Service) Complete(ctx context.Context, nodeID, challengeID string, secr
 	return denial
 }
 
-// complete checks an unconsumed challenge and enrolls the node. A
-// verifier.Error is a denial; any other error aborts the transaction.
-func (s *Service) complete(tx *store.Tx, now time.Time, nodeID string, ch *store.EnrollmentChallenge, secret []byte) error {
-	if ch.NodeID != nodeID {
-		return verifier.Reject(verifier.ReasonChallengeWrongNode, "challenge was issued to another node")
-	}
-	if !now.Before(ch.ExpiresAt) {
-		return verifier.Reject(verifier.ReasonChallengeExpired, "challenge expired at %s", ch.ExpiresAt)
-	}
-	n, err := registeredNode(tx, nodeID, store.NodeRegistered)
+// complete enrolls the node of an authenticated challenge, re-reading the
+// node and its EK under the write lock. A verifier.Error is a denial; any
+// other error aborts the transaction.
+func (s *Service) complete(tx *store.Tx, now time.Time, ch *store.EnrollmentChallenge) error {
+	n, err := registeredNode(tx.Node(ch.NodeID))
 	if err != nil {
 		return err
 	}
-	if _, err := s.reverifyEK(tx, n, now); err != nil {
+	if _, err := s.reverifyEK(n, now, txPolicy(tx)); err != nil {
 		return err
 	}
-	got := sha256.Sum256(secret)
-	if len(secret) != SecretSize || subtle.ConstantTimeCompare(got[:], ch.SecretHash) != 1 {
-		return verifier.Reject(verifier.ReasonActivationFailed, "recovered secret does not match")
-	}
-	err = tx.EnrollNode(nodeID, ch.AKPublic, ch.AKName, now)
+	err = tx.EnrollNode(ch.NodeID, ch.AKPublic, ch.AKName, now)
 	if errors.Is(err, store.ErrConflict) {
 		return verifier.Reject(verifier.ReasonAKInUse, "AK is enrolled for another live node")
 	}
 	return err
+}
+
+func parseAK(akPublic []byte) (*verifier.AK, error) {
+	if len(akPublic) > MaxAKSize {
+		return nil, verifier.Reject(verifier.ReasonAKInvalid, "AK public area exceeds %d bytes", MaxAKSize)
+	}
+	return verifier.ParseAK(akPublic)
 }
 
 // Revoke permanently revokes a node. Re-admitting the machine requires a new
@@ -313,25 +321,53 @@ func (s *Service) Revoke(ctx context.Context, actor, nodeID string) error {
 	})
 }
 
-// registeredNode loads nodeID and requires it to be in state want.
-func registeredNode(tx *store.Tx, nodeID string, want store.NodeState) (*store.Node, error) {
-	n, err := tx.Node(nodeID)
+// registeredNode requires a loaded node to be awaiting enrollment.
+func registeredNode(n *store.Node, err error) (*store.Node, error) {
 	if errors.Is(err, store.ErrNotFound) {
 		return nil, verifier.Reject(verifier.ReasonNodeUnknown, "node is not registered")
 	}
 	if err != nil {
 		return nil, err
 	}
-	if n.State != want {
-		return nil, verifier.Reject(verifier.ReasonNodeState, "node is %s, want %s", n.State, want)
+	if n.State != store.NodeRegistered {
+		return nil, verifier.Reject(verifier.ReasonNodeState, "node is %s, want %s", n.State, store.NodeRegistered)
 	}
 	return n, nil
+}
+
+// policyLoader loads the current measurement policy, only when needed.
+type policyLoader func() (*policy.Measurement, error)
+
+func txPolicy(tx *store.Tx) policyLoader {
+	return func() (*policy.Measurement, error) {
+		m, _, err := verifier.CurrentPolicy(tx)
+		return m, err
+	}
+}
+
+func storePolicy(ctx context.Context, st *store.Store) policyLoader {
+	return func() (*policy.Measurement, error) {
+		m, _, err := verifier.StoredPolicy(ctx, st)
+		return m, err
+	}
+}
+
+// admitRoot applies the development-root policy to ek.
+func admitRoot(ek *verifier.EK, load policyLoader) error {
+	if !ek.Development {
+		return nil
+	}
+	m, err := load()
+	if err != nil {
+		return err
+	}
+	return verifier.AdmitRoot(true, m)
 }
 
 // reverifyEK re-validates the registered certificate (roots or validity may
 // have changed since registration), confirms it still derives the registered
 // EK and applies the development-root policy.
-func (s *Service) reverifyEK(tx *store.Tx, n *store.Node, now time.Time) (*verifier.EK, error) {
+func (s *Service) reverifyEK(n *store.Node, now time.Time, load policyLoader) (*verifier.EK, error) {
 	ek, err := verifier.VerifyEKCert(n.EKCert, s.roots, now)
 	if err != nil {
 		return nil, err
@@ -340,24 +376,10 @@ func (s *Service) reverifyEK(tx *store.Tx, n *store.Node, now time.Time) (*verif
 	if subtle.ConstantTimeCompare(digest[:], n.EKDigest) != 1 {
 		return nil, verifier.Reject(verifier.ReasonEKCertInvalid, "certificate no longer derives the registered EK")
 	}
-	if ek.Development {
-		m, _, err := verifier.CurrentPolicy(tx)
-		if err != nil {
-			return nil, err
-		}
-		if err := verifier.AdmitRoot(true, m); err != nil {
-			return nil, err
-		}
+	if err := admitRoot(ek, load); err != nil {
+		return nil, err
 	}
 	return ek, nil
-}
-
-func newID(r io.Reader, prefix string) (string, error) {
-	var b [16]byte
-	if _, err := io.ReadFull(r, b[:]); err != nil {
-		return "", fmt.Errorf("enrollment: generating ID: %w", err)
-	}
-	return prefix + hex.EncodeToString(b[:]), nil
 }
 
 func appendAudit(tx *store.Tx, now time.Time, actor, action, nodeID string, meta map[string]any) error {

@@ -54,6 +54,8 @@ message CompleteEnrollmentRequest {
   string node_id = 1;
   string challenge_id = 2;
   bytes secret = 3;
+  // The ak_public sent to BeginEnrollment; the secret is bound to it.
+  bytes ak_public = 4;
 }
 
 message CompleteEnrollmentResponse {}

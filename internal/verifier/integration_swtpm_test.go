@@ -150,7 +150,7 @@ func (c *chain) enrollNode(nodeID string) {
 	if err != nil {
 		c.t.Fatalf("ActivateCredential: %v", err)
 	}
-	if err := c.enroll.Complete(ctx, nodeID, ch.ID, secret); err != nil {
+	if err := c.enroll.Complete(ctx, nodeID, ch.ID, c.ak.PublicBytes(), secret); err != nil {
 		c.t.Fatalf("Complete: %v", err)
 	}
 }
@@ -294,7 +294,7 @@ func TestEnrollmentRequiresResidentAK(t *testing.T) {
 		if _, err := tpm.ActivateCredential(c.dev, c.ek, c.ak, ch.CredentialBlob, ch.EncryptedSecret); err == nil {
 			t.Fatal("TPM released a credential bound to a key it does not hold")
 		}
-		wantReason(t, c.enroll.Complete(ctx, "node-1", ch.ID, make([]byte, enrollment.SecretSize)),
+		wantReason(t, c.enroll.Complete(ctx, "node-1", ch.ID, fake.PublicBytes(), make([]byte, enrollment.SecretSize)),
 			verifier.ReasonActivationFailed)
 
 		// The genuine AK still enrolls afterwards.
