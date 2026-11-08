@@ -49,19 +49,20 @@ func (c *clock) Now() time.Time { c.mu.Lock(); defer c.mu.Unlock(); return c.now
 func (c *clock) Add(d time.Duration) { c.mu.Lock(); c.now = c.now.Add(d); c.mu.Unlock() }
 
 type env struct {
-	t     *testing.T
-	clk   *clock
-	st    *store.Store
-	ca    *identity.CA
-	boot  *eventlog.Builder
-	cert  *ServerCert
-	lis   *bufconn.Listener
-	logs  *bytes.Buffer
-	ident *identity.Service
-	enr   *enrollment.Service
-	ver   *verifier.Service
-	ekCA  *swtpmtest.CA
-	log   *slog.Logger
+	t      *testing.T
+	dbPath string
+	clk    *clock
+	st     *store.Store
+	ca     *identity.CA
+	boot   *eventlog.Builder
+	cert   *ServerCert
+	lis    *bufconn.Listener
+	logs   *bytes.Buffer
+	ident  *identity.Service
+	enr    *enrollment.Service
+	ver    *verifier.Service
+	ekCA   *swtpmtest.CA
+	log    *slog.Logger
 }
 
 // unlimited effectively disables rate limiting; bufconn peers share a key.
@@ -75,7 +76,8 @@ func newEnv(t *testing.T) *env {
 func newEnvLimited(t *testing.T, lim RateLimits) *env {
 	t.Helper()
 	clk := &clock{now: time.Now().UTC().Truncate(time.Second)}
-	st, err := store.Open(bg, filepath.Join(t.TempDir(), "attest.db"))
+	dbPath := filepath.Join(t.TempDir(), "attest.db")
+	st, err := store.Open(bg, dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,7 +86,7 @@ func newEnvLimited(t *testing.T, lim RateLimits) *env {
 	if err != nil {
 		t.Fatal(err)
 	}
-	e := &env{t: t, clk: clk, st: st, ca: ca, boot: eventlog.SimulatedBoot("v1"), logs: &bytes.Buffer{}}
+	e := &env{t: t, dbPath: dbPath, clk: clk, st: st, ca: ca, boot: eventlog.SimulatedBoot("v1"), logs: &bytes.Buffer{}}
 	log := slog.New(slog.NewTextHandler(e.logs, nil))
 	e.log = log
 	e.ekCA = swtpmtest.NewCA(t, "Production EK CA")
