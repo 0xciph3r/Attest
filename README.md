@@ -94,6 +94,7 @@ Planned: `cmd/attestd`, `cmd/attest-agent`, `api/proto`, `internal/{identity,bro
 - [Audit ledger](docs/audit-ledger.md)
 - [Enrollment and key lifecycle](docs/enrollment.md)
 - [Platform limitations](docs/platform-limitations.md)
+- [Saturation testing](docs/saturation.md)
 
 ## License
 

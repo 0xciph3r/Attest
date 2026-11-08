@@ -232,8 +232,10 @@ effect.
 - Contract for later components: an operation that must be audited performs
   its state change and its audit append in a way that a failed append prevents
   the effect (same transaction, or append-before-release for secret delivery).
-- Tests: planned per component — inject audit-store failure and assert no
-  identity or secret is released.
+- Tests: attestation under concurrent load with injected audit-append
+  failure reports no success that lacks its record and audit entry, and
+  resumes when the fault clears ([saturation testing](saturation.md)).
+  Secret release still needs the same test when the broker is built.
 
 ## P10 Recovery
 
