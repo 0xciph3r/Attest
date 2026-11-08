@@ -29,6 +29,7 @@ import (
 	"github.com/0xciph3r/attest/internal/eventlog"
 	"github.com/0xciph3r/attest/internal/identity"
 	"github.com/0xciph3r/attest/internal/store"
+	"github.com/0xciph3r/attest/internal/tpm/swtpm/swtpmtest"
 	"github.com/0xciph3r/attest/internal/verifier"
 	"github.com/0xciph3r/attest/internal/verifier/verifiertest"
 )
@@ -57,6 +58,10 @@ type env struct {
 	lis   *bufconn.Listener
 	logs  *bytes.Buffer
 	ident *identity.Service
+	enr   *enrollment.Service
+	ver   *verifier.Service
+	ekCA  *swtpmtest.CA
+	log   *slog.Logger
 }
 
 func newEnv(t *testing.T) *env {
@@ -73,8 +78,12 @@ func newEnv(t *testing.T) *env {
 	}
 	e := &env{t: t, clk: clk, st: st, ca: ca, boot: eventlog.SimulatedBoot("v1"), logs: &bytes.Buffer{}}
 	log := slog.New(slog.NewTextHandler(e.logs, nil))
+	e.log = log
+	e.ekCA = swtpmtest.NewCA(t, "Production EK CA")
+	roots := x509.NewCertPool()
+	roots.AddCert(e.ekCA.Cert)
 
-	enr, err := enrollment.New(enrollment.Config{Store: st, Now: clk.Now})
+	enr, err := enrollment.New(enrollment.Config{Store: st, Roots: verifier.EKRoots{Production: roots}, Now: clk.Now})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,6 +100,7 @@ func newEnv(t *testing.T) *env {
 	if _, err := e.ident.ApplyWorkloadPolicy(bg, "operator:alice", []byte(workloadPolicy)); err != nil {
 		t.Fatal(err)
 	}
+	e.enr, e.ver = enr, ver
 	ns, err := NewNodeServer(NodeConfig{Enrollment: enr, Verifier: ver, Identity: e.ident, Log: log})
 	if err != nil {
 		t.Fatal(err)
