@@ -64,7 +64,15 @@ type env struct {
 	log   *slog.Logger
 }
 
+// unlimited effectively disables rate limiting; bufconn peers share a key.
+var unlimited = RateLimits{PerPeer: 1e9, PerPeerBurst: 1e9, Global: 1e9, GlobalBurst: 1e9, MaxPeers: 1}
+
 func newEnv(t *testing.T) *env {
+	t.Helper()
+	return newEnvLimited(t, unlimited)
+}
+
+func newEnvLimited(t *testing.T, lim RateLimits) *env {
 	t.Helper()
 	clk := &clock{now: time.Now().UTC().Truncate(time.Second)}
 	st, err := store.Open(bg, filepath.Join(t.TempDir(), "attest.db"))
@@ -109,7 +117,7 @@ func newEnv(t *testing.T) *env {
 		t.Fatal(err)
 	}
 	e.lis = bufconn.Listen(1 << 20)
-	srv := NewNodeGRPCServer(ns, e.cert)
+	srv := NewNodeGRPCServer(ns, e.cert, NewRateLimiter(lim, log))
 	go func() { _ = srv.Serve(e.lis) }()
 	t.Cleanup(srv.Stop)
 	return e

@@ -153,6 +153,7 @@ func serve(ctx context.Context, cfg *Config, log *slog.Logger, ready func(node n
 	if err != nil {
 		return err
 	}
+	nodeLis = api.LimitNodeListener(nodeLis)
 	adminLis, err := api.ListenUnix(cfg.AdminSocket, cfg.adminMode, cfg.socketGID())
 	if err != nil {
 		_ = nodeLis.Close()
@@ -170,7 +171,7 @@ func serve(ctx context.Context, cfg *Config, log *slog.Logger, ready func(node n
 		return err
 	}
 
-	nodeSrv, adminSrv := api.NewNodeGRPCServer(ns, cert), api.NewAdminGRPCServer(as)
+	nodeSrv, adminSrv := api.NewNodeGRPCServer(ns, cert, api.NewRateLimiter(api.DefaultRateLimits, log)), api.NewAdminGRPCServer(as)
 	errc := make(chan error, 2)
 	go func() { errc <- fmt.Errorf("node listener: %w", nodeSrv.Serve(nodeLis)) }()
 	go func() { errc <- fmt.Errorf("admin listener: %w", adminSrv.Serve(adminLis)) }()
