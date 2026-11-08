@@ -332,6 +332,8 @@ func (s *Service) IssueWorkload(ctx context.Context, parent *x509.Certificate, c
 
 // checkAttestation requires a to be the node's latest attestation, to have
 // passed under the current measurement policy, and the node to be enrolled.
+// A later failure supersedes a pass. This is safe only because the verifier
+// records attempts that the node's own AK signed, so others cannot forge one.
 func (s *Service) checkAttestation(tx *store.Tx, a *store.Attestation) error {
 	n, err := tx.Node(a.NodeID)
 	if err != nil {

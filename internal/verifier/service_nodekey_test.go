@@ -78,19 +78,21 @@ func TestServiceRejectsKeyBinding(t *testing.T) {
 		name   string
 		mutate func(t *testing.T, e *svcEnv, ak *verifiertest.AK, ev *Evidence)
 		want   Reason
+		// Failures before the quote authenticates are not recorded.
+		recorded bool
 	}{
 		{"key substituted", func(t *testing.T, _ *svcEnv, _ *verifiertest.AK, ev *Evidence) {
 			ev.NodeKey.Public = verifiertest.NewNodeKey(t).PublicBytes()
-		}, ReasonNonceMismatch},
-		{"certification by another node's AK", func(t *testing.T, _ *svcEnv, _ *verifiertest.AK, ev *Evidence) {
-			ev.NodeKey.CertifySignature = verifiertest.NewAK(t).Sign(t, ev.NodeKey.Certify)
-		}, ReasonBadSignature},
+		}, ReasonNonceMismatch, false},
 		{"AK as node key", func(_ *testing.T, _ *svcEnv, ak *verifiertest.AK, ev *Evidence) {
 			ev.NodeKey.Public = ak.PublicBytes()
-		}, ReasonKeyInvalid},
+		}, ReasonKeyInvalid, false},
+		{"certification by another node's AK", func(t *testing.T, _ *svcEnv, _ *verifiertest.AK, ev *Evidence) {
+			ev.NodeKey.CertifySignature = verifiertest.NewAK(t).Sign(t, ev.NodeKey.Certify)
+		}, ReasonBadSignature, true},
 		{"no certification", func(_ *testing.T, _ *svcEnv, _ *verifiertest.AK, ev *Evidence) {
 			ev.NodeKey.Certify, ev.NodeKey.CertifySignature = nil, nil
-		}, ReasonMalformed},
+		}, ReasonMalformed, true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -99,6 +101,14 @@ func TestServiceRejectsKeyBinding(t *testing.T) {
 			c := e.challenge("node-1")
 			ev := e.boundEvidence(ak, verifiertest.NewNodeKey(t), c)
 			tc.mutate(t, e, ak, ev)
+			if !tc.recorded {
+				e.unchanged(tc.name, func() error {
+					_, err := e.svc.Verify(bg, "node-1", c.ID, c.Nonce, ev)
+					wantServiceReason(t, err, tc.want)
+					return err
+				})
+				return
+			}
 			_, err := e.svc.Verify(bg, "node-1", c.ID, c.Nonce, ev)
 			wantServiceReason(t, err, tc.want)
 

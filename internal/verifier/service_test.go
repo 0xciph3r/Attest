@@ -3,8 +3,11 @@ package verifier
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -112,17 +115,13 @@ func TestServiceAttest(t *testing.T) {
 		t.Fatalf("recorded %+v, %v", a, err)
 	}
 
-	// Replaying the same evidence is refused, audited, and does not add a
-	// second verdict for the challenge.
-	_, err = e.svc.Verify(bg, "node-1", c.ID, c.Nonce, ev)
-	wantServiceReason(t, err, ReasonChallengeConsumed)
-	if a2, _ := e.st.LatestAttestation(bg, "node-1"); a2.ID != a.ID {
-		t.Fatal("replay recorded a verdict")
-	}
-	head, _ := e.st.AuditHead(bg)
-	if head.Sequence != 3 { // policy.apply, node.attest, node.attest.denied
-		t.Fatalf("audit head %d", head.Sequence)
-	}
+	// Replaying the same evidence is refused and records nothing: anyone
+	// who saw it could replay it indefinitely.
+	e.unchanged("replay", func() error {
+		_, err := e.svc.Verify(bg, "node-1", c.ID, c.Nonce, ev)
+		wantServiceReason(t, err, ReasonChallengeConsumed)
+		return err
+	})
 	e.verifyAudit()
 }
 
@@ -133,8 +132,10 @@ func wantServiceReason(t *testing.T, err error, want Reason) {
 	}
 }
 
-// Every failed attempt against a live challenge consumes it and records a
-// failed verdict with the specific reason.
+// Evidence the node's AK signed over the challenge nonce consumes the
+// challenge and records a failed verdict with the specific reason. Anything
+// else could have come from anyone, so it is refused without writing
+// anything and leaves the challenge usable.
 func TestServiceRejects(t *testing.T) {
 	e := newSvcEnv(t)
 	ak := e.node("node-1", false)
@@ -142,11 +143,14 @@ func TestServiceRejects(t *testing.T) {
 	other := verifiertest.NewAK(t)
 
 	cases := []struct {
-		name   string
-		node   string
-		before func()
-		mutate func(c *Challenge, ev *Evidence) (nonce []byte)
-		want   Reason
+		name     string
+		node     string
+		before   func()
+		mutate   func(c *Challenge, ev *Evidence) (nonce []byte)
+		want     Reason
+		recorded bool
+		// honest is the outcome of then answering the challenge honestly.
+		honest Reason
 	}{
 		{name: "wrong nonce echoed", want: ReasonNonceMismatch,
 			mutate: func(c *Challenge, ev *Evidence) []byte { return bytes.Repeat([]byte{1}, NonceSize) }},
@@ -160,29 +164,31 @@ func TestServiceRejects(t *testing.T) {
 				ev.Signature = other.Sign(t, ev.Attest)
 				return c.Nonce
 			}},
-		{name: "claimed PCR differs from quote", want: ReasonPCRDigest,
+		{name: "junk evidence", want: ReasonMalformed,
+			mutate: func(c *Challenge, ev *Evidence) []byte { *ev = Evidence{}; return c.Nonce }},
+		{name: "answered by another node", node: "node-2", want: ReasonNonceMismatch},
+		{name: "claimed PCR differs from quote", want: ReasonPCRDigest, recorded: true,
 			mutate: func(c *Challenge, ev *Evidence) []byte {
 				ev.PCRs[7] = bytes.Repeat([]byte{7}, 32)
 				return c.Nonce
 			}},
-		{name: "event log does not replay", want: ReasonEventLogReplay,
+		{name: "event log does not replay", want: ReasonEventLogReplay, recorded: true,
 			mutate: func(c *Challenge, ev *Evidence) []byte {
 				ev.EventLog = eventlog.SimulatedBoot("v2").Bytes()
 				return c.Nonce
 			}},
-		{name: "event log missing", want: ReasonEventLogInvalid,
+		{name: "event log missing", want: ReasonEventLogInvalid, recorded: true,
 			mutate: func(c *Challenge, ev *Evidence) []byte { ev.EventLog = nil; return c.Nonce }},
-		{name: "measurements not in policy", want: ReasonMeasurement,
+		{name: "measurements not in policy", want: ReasonMeasurement, recorded: true,
 			mutate: func(c *Challenge, ev *Evidence) []byte {
 				*ev = *evidence(t, ak, c, eventlog.SimulatedBoot("v2"))
 				return c.Nonce
 			}},
-		{name: "expired", want: ReasonChallengeExpired,
-			before: func() { e.now = e.now.Add(DefaultChallengeTTL) }},
-		{name: "answered by another node", node: "node-2", want: ReasonChallengeWrongNode},
-		{name: "policy changed after challenge", want: ReasonMeasurement,
+		{name: "policy changed after challenge", want: ReasonMeasurement, recorded: true,
 			before: func() { e.apply(false, eventlog.SimulatedBoot("v2")) }},
-		{name: "node revoked after challenge", want: ReasonNodeNotEnrolled,
+		{name: "expired", want: ReasonChallengeExpired, honest: ReasonChallengeExpired,
+			before: func() { e.now = e.now.Add(DefaultChallengeTTL) }},
+		{name: "node revoked after challenge", want: ReasonNodeNotEnrolled, honest: ReasonNodeNotEnrolled,
 			before: func() {
 				if err := e.st.Update(bg, func(tx *store.Tx) error { return tx.RevokeNode("node-1", e.now) }); err != nil {
 					t.Fatal(err)
@@ -206,16 +212,23 @@ func TestServiceRejects(t *testing.T) {
 			if tc.node != "" {
 				node = tc.node
 			}
+			before := e.dump()
 			_, err := e.svc.Verify(bg, node, c.ID, nonce, ev)
 			wantServiceReason(t, err, tc.want)
 
-			a, err := e.st.LatestAttestation(bg, "node-1")
-			if err != nil || a.Passed || a.ChallengeID != c.ID || a.Reason != string(tc.want) {
-				t.Fatalf("recorded %+v, %v", a, err)
+			if tc.recorded {
+				a, err := e.st.LatestAttestation(bg, "node-1")
+				if err != nil || a.Passed || a.ChallengeID != c.ID || a.Reason != string(tc.want) {
+					t.Fatalf("recorded %+v, %v", a, err)
+				}
+				tc.honest = ReasonChallengeConsumed
+			} else if after := e.dump(); after != before {
+				t.Fatalf("unauthenticated failure changed the database:\n%s\n---\n%s", before, after)
 			}
-			// The honest answer can no longer be used.
 			_, err = e.svc.Verify(bg, "node-1", c.ID, c.Nonce, evidence(t, ak, c, e.boot))
-			wantServiceReason(t, err, ReasonChallengeConsumed)
+			wantServiceReason(t, err, tc.honest)
+			// Restore the baseline policy for the next case.
+			e.apply(false, e.boot)
 		})
 	}
 	e.verifyAudit()
@@ -272,25 +285,73 @@ func TestServiceChallengeRejects(t *testing.T) {
 	wantServiceReason(t, err, ReasonPolicyMissing)
 }
 
-func TestServiceUnknownChallengeAuditedOnly(t *testing.T) {
+// Challenges are MACs under a per-process key: one cannot be forged,
+// extended, moved to another node, or redeemed after a restart, and none of
+// those attempts writes anything.
+func TestServiceForgedChallengesLeaveNoState(t *testing.T) {
 	e := newSvcEnv(t)
 	ak := e.node("node-1", false)
+	e.node("node-2", false)
 	c := e.challenge("node-1")
 	ev := evidence(t, ak, c, e.boot)
-	_, err := e.svc.Verify(bg, "node-1", "att_00000000000000000000000000000000", c.Nonce, ev)
-	wantServiceReason(t, err, ReasonChallengeUnknown)
-	if _, err := e.st.LatestAttestation(bg, "node-1"); !errors.Is(err, store.ErrNotFound) {
-		t.Fatalf("verdict recorded for unknown challenge: %v", err)
+
+	var later [8]byte
+	binary.BigEndian.PutUint64(later[:], uint64(c.ExpiresAt.Add(time.Hour).UnixNano())) //nolint:gosec // after 1970
+	extended := c.ID[:36] + hex.EncodeToString(later[:])
+	if !challengeIDRe.MatchString(extended) {
+		t.Fatalf("bad test ID %s", extended)
 	}
-	if h, _ := e.st.AuditHead(bg); h.Sequence != 2 {
-		t.Fatalf("denial not audited: head %d", h.Sequence)
+	restarted, err := NewService(ServiceConfig{Store: e.st, Now: func() time.Time { return e.now }})
+	if err != nil {
+		t.Fatal(err)
 	}
-	// The real challenge is untouched.
+	other := e.challenge("node-2")
+	for name, verify := range map[string]func() error{
+		"invented ID": func() error {
+			_, err := e.svc.Verify(bg, "node-1", "att_"+strings.Repeat("0", 32)+c.ID[36:], c.Nonce, ev)
+			return err
+		},
+		"expiry extended": func() error {
+			_, err := e.svc.Verify(bg, "node-1", extended, c.Nonce, ev)
+			return err
+		},
+		"another node's challenge": func() error {
+			_, err := e.svc.Verify(bg, "node-1", other.ID, other.Nonce, evidence(t, ak, other, e.boot))
+			return err
+		},
+		"after restart": func() error {
+			_, err := restarted.Verify(bg, "node-1", c.ID, c.Nonce, ev)
+			return err
+		},
+	} {
+		e.unchanged(name, func() error {
+			err := verify()
+			if ReasonOf(err) != ReasonNonceMismatch {
+				t.Errorf("%s: got %v, want %s", name, err, ReasonNonceMismatch)
+			}
+			return err
+		})
+	}
 	if _, err := e.svc.Verify(bg, "node-1", c.ID, c.Nonce, ev); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := e.svc.Verify(bg, "node-1", "bogus", c.Nonce, ev); !errors.Is(err, ErrInvalidRequest) {
-		t.Fatal(err)
+}
+
+// Issuing a challenge writes nothing, however many are asked for.
+func TestServiceChallengeWritesNothing(t *testing.T) {
+	e := newSvcEnv(t)
+	e.node("node-1", false)
+	before := e.dump()
+	seen := map[string]bool{}
+	for range 100 {
+		c := e.challenge("node-1")
+		if seen[c.ID] || seen[string(c.Nonce)] {
+			t.Fatal("challenge repeated")
+		}
+		seen[c.ID], seen[string(c.Nonce)] = true, true
+	}
+	if after := e.dump(); after != before {
+		t.Fatalf("challenges changed the database:\n%s\n---\n%s", before, after)
 	}
 }
 

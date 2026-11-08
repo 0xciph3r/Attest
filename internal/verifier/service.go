@@ -2,6 +2,7 @@ package verifier
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -39,9 +40,9 @@ const (
 // are refused before any state is read or written.
 var ErrInvalidRequest = errors.New("verifier: invalid request")
 
-var (
-	challengeIDRe = regexp.MustCompile(`^att_[0-9a-f]{32}$`)
-)
+// A challenge ID is a random part and the challenge's expiry in Unix
+// nanoseconds, hex encoded.
+var challengeIDRe = regexp.MustCompile(`^att_[0-9a-f]{48}$`)
 
 // ServiceConfig configures a Service.
 type ServiceConfig struct {
@@ -54,12 +55,20 @@ type ServiceConfig struct {
 }
 
 // Service issues attestation challenges, verifies the resulting evidence
-// against enrolled keys and the current policy, and records every verdict.
+// against enrolled keys and the current policy, and records every verdict
+// on evidence the node's TPM produced.
+//
+// Challenges are stateless: the nonce is a MAC, under a key held only in
+// memory, of the node and the challenge ID, which carries the expiry. So
+// issuing one writes nothing, and a restart invalidates every outstanding
+// challenge. A challenge is stored only when it is consumed, which is what
+// makes it single-use.
 type Service struct {
 	st   *store.Store
 	ttl  time.Duration
 	now  func() time.Time
 	rand io.Reader
+	key  []byte
 }
 
 // NewService returns an attestation service.
@@ -76,6 +85,10 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 	}
 	if s.rand == nil {
 		s.rand = rand.Reader
+	}
+	s.key = make([]byte, sha256.Size)
+	if _, err := io.ReadFull(s.rand, s.key); err != nil {
+		return nil, fmt.Errorf("verifier: generating challenge key: %w", err)
 	}
 	return s, nil
 }
@@ -113,46 +126,54 @@ type Challenge struct {
 	ExpiresAt time.Time
 }
 
-// Challenge issues a single-use nonce to an enrolled node. Only the nonce's
-// hash is stored.
+// Challenge issues a single-use nonce to an enrolled node. It writes
+// nothing: the caller is not authenticated.
 func (s *Service) Challenge(ctx context.Context, nodeID string) (*Challenge, error) {
 	if !policy.ValidNodeID(nodeID) {
 		return nil, ErrInvalidRequest
 	}
-	now := s.now()
-	nonce := make([]byte, NonceSize)
-	if _, err := io.ReadFull(s.rand, nonce); err != nil {
-		return nil, fmt.Errorf("verifier: generating nonce: %w", err)
+	if _, err := s.enrolledNode(ctx, nodeID); err != nil {
+		return nil, err
 	}
-	id, err := newID(s.rand, "att_")
+	m, _, err := parseCurrent(s.st.CurrentPolicy(ctx, store.PolicyMeasurement))
 	if err != nil {
 		return nil, err
 	}
-	var pcrs []uint32
-	err = s.st.Update(ctx, func(tx *store.Tx) error {
-		n, err := tx.Node(nodeID)
-		if errors.Is(err, store.ErrNotFound) {
-			return fail(ReasonNodeUnknown, "node is not registered")
-		} else if err != nil {
-			return err
-		}
-		if n.State != store.NodeEnrolled {
-			return fail(ReasonNodeNotEnrolled, "node is %s", n.State)
-		}
-		m, _, err := CurrentPolicy(tx)
-		if err != nil {
-			return err
-		}
-		pcrs = m.PCRs
-		h := sha256.Sum256(nonce)
-		return tx.InsertAttestChallenge(&store.AttestChallenge{
-			ID: id, NodeID: nodeID, NonceHash: h[:], IssuedAt: now, ExpiresAt: now.Add(s.ttl),
-		})
-	})
-	if err != nil {
+	var b [24]byte
+	if _, err := io.ReadFull(s.rand, b[:16]); err != nil {
+		return nil, fmt.Errorf("verifier: generating challenge: %w", err)
+	}
+	expires := s.now().Add(s.ttl).Round(0)
+	binary.BigEndian.PutUint64(b[16:], uint64(expires.UnixNano())) //nolint:gosec // after 1970
+	id := "att_" + hex.EncodeToString(b[:])
+	return &Challenge{ID: id, Nonce: s.nonce(nodeID, id), PCRs: m.PCRs, ExpiresAt: time.Unix(0, expires.UnixNano())}, nil
+}
+
+// nonce derives the nonce of challenge id for nodeID.
+func (s *Service) nonce(nodeID, id string) []byte {
+	m := hmac.New(sha256.New, s.key)
+	// Node IDs and challenge IDs contain no NUL.
+	m.Write([]byte("attest/v1/attestation-nonce\x00" + nodeID + "\x00" + id))
+	return m.Sum(nil)
+}
+
+// challengeExpiry reads the expiry from a well-formed challenge ID.
+func challengeExpiry(id string) time.Time {
+	b, _ := hex.DecodeString(id[len(id)-16:])
+	return time.Unix(0, int64(binary.BigEndian.Uint64(b))) //nolint:gosec // round-trips Challenge
+}
+
+func (s *Service) enrolledNode(ctx context.Context, nodeID string) (*store.Node, error) {
+	n, err := s.st.Node(ctx, nodeID)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil, fail(ReasonNodeUnknown, "node is not registered")
+	} else if err != nil {
 		return nil, err
 	}
-	return &Challenge{ID: id, Nonce: nonce, PCRs: pcrs, ExpiresAt: now.Add(s.ttl)}, nil
+	if n.State != store.NodeEnrolled {
+		return nil, fail(ReasonNodeNotEnrolled, "node is %s", n.State)
+	}
+	return n, nil
 }
 
 // Verdict is a successful attestation.
@@ -169,41 +190,68 @@ type Verdict struct {
 	NodeKey *NodeKey
 }
 
-// Verify checks evidence answering challengeID. Any attempt against a live
-// challenge consumes it, and the verdict, pass or fail, is recorded with an
-// audit entry in the same transaction; if either write fails, nothing is
-// recorded and the attempt is refused. Attempts against unknown or consumed
-// challenges are audited only.
+// Verify checks evidence answering challengeID.
+//
+// Nothing is recorded until the evidence is shown to come from the node's
+// TPM: the challenge must be live and issued to nodeID, and the quote signed
+// by the node's enrolled AK over its nonce. Requests failing those checks
+// can come from anyone, so they are refused without writing anything, the
+// audit ledger included; otherwise anyone could grow the ledger, or record a
+// failure that supersedes the node's last good attestation.
+//
+// Authenticated evidence consumes the challenge, and the verdict, pass or
+// fail, is recorded with an audit entry in the same transaction; if either
+// write fails, nothing is recorded and the attempt is refused. Evidence for
+// a challenge already consumed is refused without a record.
 func (s *Service) Verify(ctx context.Context, nodeID, challengeID string, nonce []byte, ev *Evidence) (*Verdict, error) {
 	if !challengeIDRe.MatchString(challengeID) || !policy.ValidNodeID(nodeID) || ev == nil {
 		return nil, ErrInvalidRequest
 	}
 	now := s.now()
+	// A challenge issued to another node has a different nonce.
+	if subtle.ConstantTimeCompare(nonce, s.nonce(nodeID, challengeID)) != 1 {
+		return nil, fail(ReasonNonceMismatch, "nonce does not match the challenge")
+	}
+	expires := challengeExpiry(challengeID)
+	if !now.Before(expires) {
+		return nil, fail(ReasonChallengeExpired, "challenge expired at %s", expires)
+	}
+	n, err := s.enrolledNode(ctx, nodeID)
+	if err != nil {
+		return nil, err
+	}
+	ak, err := ParseAK(n.AKPublic)
+	if err != nil {
+		return nil, fmt.Errorf("verifier: stored AK for %s: %w", n.ID, err)
+	}
+	if err := AuthenticateEvidence(ak, nonce, ev); err != nil {
+		return nil, err
+	}
+
 	actor := "node:" + nodeID
 	var (
 		verdict *Verdict
 		denial  error
 	)
-	err := s.st.Update(ctx, func(tx *store.Tx) error {
-		ch, err := tx.AttestChallenge(challengeID)
-		switch {
-		case errors.Is(err, store.ErrNotFound):
-			denial = fail(ReasonChallengeUnknown, "no such attestation challenge")
-		case err != nil:
-			return err
-		case !ch.ConsumedAt.IsZero():
+	err = s.st.Update(ctx, func(tx *store.Tx) error {
+		switch _, err := tx.AttestChallenge(challengeID); {
+		case err == nil:
 			denial = fail(ReasonChallengeConsumed, "attestation challenge already used")
+			return nil
+		case !errors.Is(err, store.ErrNotFound):
+			return err
 		}
-		if denial != nil {
-			return appendAudit(tx, now, actor, ActionAttestDenied, "node/"+nodeID, map[string]any{
-				"challenge": challengeID, "reason": ReasonOf(denial),
-			})
+		h := sha256.Sum256(nonce)
+		ch := &store.AttestChallenge{ID: challengeID, NodeID: nodeID, NonceHash: h[:],
+			IssuedAt: expires.Add(-s.ttl), ExpiresAt: expires}
+		if err := tx.InsertAttestChallenge(ch); err != nil {
+			return err
 		}
 		if err := tx.ConsumeAttestChallenge(ch.ID, now); err != nil {
 			return err
 		}
 		a := &store.Attestation{NodeID: ch.NodeID, ChallengeID: ch.ID, VerifiedAt: now, EvidenceHash: evidenceHash(nonce, ev)}
-		v, err := s.verify(tx, now, nodeID, ch, nonce, ev, a)
+		v, err := s.verify(tx, now, ch, nonce, ev, a)
 		if ReasonOf(err) == "" && err != nil {
 			return err
 		}
@@ -214,9 +262,6 @@ func (s *Service) Verify(ctx context.Context, nodeID, challengeID string, nonce 
 			action = ActionAttestDenied
 			a.Reason = string(ReasonOf(err))
 			meta["reason"] = a.Reason
-			if ch.NodeID != nodeID {
-				meta["claimed_node"] = nodeID
-			}
 		} else {
 			a.Passed = true
 			meta["reference"] = a.Reference
@@ -225,7 +270,6 @@ func (s *Service) Verify(ctx context.Context, nodeID, challengeID string, nonce 
 				meta["key_binding"] = hex.EncodeToString(v.NodeKey.SPKIHash)
 			}
 		}
-		// The verdict is attributed to the node the challenge was issued to.
 		e, err := tx.AppendAudit(audit.Record{Time: now, Actor: actor, Action: action, Object: "node/" + ch.NodeID,
 			Metadata: mustJSON(meta)})
 		if err != nil {
@@ -253,18 +297,10 @@ func (s *Service) Verify(ctx context.Context, nodeID, challengeID string, nonce 
 
 // verify evaluates a consumed challenge, filling a with what was learned. A
 // *Error is a denial; any other error aborts the transaction.
-func (s *Service) verify(tx *store.Tx, now time.Time, nodeID string, ch *store.AttestChallenge,
+// The node and its AK are read again here, under the write lock, so a
+// concurrent revocation or re-enrollment is seen.
+func (s *Service) verify(tx *store.Tx, now time.Time, ch *store.AttestChallenge,
 	nonce []byte, ev *Evidence, a *store.Attestation) (*Verdict, error) {
-	if ch.NodeID != nodeID {
-		return nil, fail(ReasonChallengeWrongNode, "challenge was issued to another node")
-	}
-	if !now.Before(ch.ExpiresAt) {
-		return nil, fail(ReasonChallengeExpired, "challenge expired at %s", ch.ExpiresAt)
-	}
-	h := sha256.Sum256(nonce)
-	if len(nonce) != NonceSize || subtle.ConstantTimeCompare(h[:], ch.NonceHash) != 1 {
-		return nil, fail(ReasonNonceMismatch, "nonce does not match the challenge")
-	}
 	n, err := tx.Node(ch.NodeID)
 	if err != nil {
 		return nil, err
@@ -323,14 +359,6 @@ func evidenceHash(nonce []byte, ev *Evidence) []byte {
 		field(k.CertifySignature)
 	}
 	return h.Sum(nil)
-}
-
-func newID(r io.Reader, prefix string) (string, error) {
-	var b [16]byte
-	if _, err := io.ReadFull(r, b[:]); err != nil {
-		return "", fmt.Errorf("verifier: generating ID: %w", err)
-	}
-	return prefix + hex.EncodeToString(b[:]), nil
 }
 
 func mustJSON(v any) []byte {

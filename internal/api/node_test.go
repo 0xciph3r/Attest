@@ -266,7 +266,7 @@ func TestAttestRejects(t *testing.T) {
 	ak := e.node("n1")
 	c := e.client(nil)
 
-	_, err := c.Attest(bg, &attestv1.AttestRequest{NodeId: "n1", ChallengeId: "att_" + strings.Repeat("0", 32)})
+	_, err := c.Attest(bg, &attestv1.AttestRequest{NodeId: "n1", ChallengeId: "att_" + strings.Repeat("0", 48)})
 	expectCode(t, "no evidence", err, codes.InvalidArgument, "")
 
 	ch, err := c.GetChallenge(bg, &attestv1.GetChallengeRequest{NodeId: "n1"})
@@ -280,6 +280,11 @@ func TestAttestRejects(t *testing.T) {
 		Evidence: &attestv1.Evidence{Attest: attest, Signature: sig, Pcrs: pcrs, EventLog: e.boot.Bytes()}}
 	_, err = c.Attest(bg, req)
 	expectCode(t, "quote over another nonce", err, codes.PermissionDenied, "nonce_mismatch")
+	// That attempt was not the node's, so the challenge is still live.
+	req.Evidence.Attest, req.Evidence.Signature = ak.Quote(t, ch.GetNonce(), pcrs)
+	if _, err := c.Attest(bg, req); err != nil {
+		t.Fatalf("honest answer after a forged one: %v", err)
+	}
 	_, err = c.Attest(bg, req)
 	expectCode(t, "replayed challenge", err, codes.PermissionDenied, "challenge_consumed")
 
@@ -541,5 +546,47 @@ func TestOversizedRequest(t *testing.T) {
 func TestNewNodeServerRequiresServices(t *testing.T) {
 	if _, err := NewNodeServer(NodeConfig{}); err == nil {
 		t.Fatal("accepted")
+	}
+}
+
+// GetChallenge and Attest are unauthenticated and node IDs are public, so
+// anyone can answer a challenge for a node. Junk answers must not record a
+// failure that supersedes the node's attestation, which would cut off its
+// workload identities.
+func TestForeignAttemptsCannotSupersedeNode(t *testing.T) {
+	e := newEnv(t)
+	node, _ := e.nodeIdentity()
+	issue := func() error {
+		_, err := node.IssueWorkloadIdentity(bg, &attestv1.IssueWorkloadIdentityRequest{
+			SystemdUnit: "api.service", Uid: 1000, Csr: csr(t, p256(t))})
+		return err
+	}
+	if err := issue(); err != nil {
+		t.Fatal(err)
+	}
+	attacker := e.client(nil)
+	impostor := verifiertest.NewAK(t)
+	for range 3 {
+		ch, err := attacker.GetChallenge(bg, &attestv1.GetChallengeRequest{NodeId: "n1"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		pcrs := e.boot.PCRs(ch.GetPcrs()...)
+		for _, ev := range []*attestv1.Evidence{
+			{Attest: []byte("junk"), Signature: []byte("junk")},
+			func() *attestv1.Evidence {
+				a, s := impostor.Quote(t, ch.GetNonce(), pcrs)
+				return &attestv1.Evidence{Attest: a, Signature: s, Pcrs: pcrs, EventLog: e.boot.Bytes()}
+			}(),
+		} {
+			_, err := attacker.Attest(bg, &attestv1.AttestRequest{NodeId: "n1", ChallengeId: ch.GetChallengeId(),
+				Nonce: ch.GetNonce(), Evidence: ev})
+			if status.Code(err) != codes.PermissionDenied {
+				t.Fatalf("junk attestation: %v", err)
+			}
+		}
+	}
+	if err := issue(); err != nil {
+		t.Fatalf("node cut off by foreign attempts: %v", err)
 	}
 }

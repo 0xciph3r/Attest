@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -50,8 +51,16 @@ func TestServiceFailuresLeaveNoState(t *testing.T) {
 	c := e.challenge("node-1")
 	ev := evidence(t, ak, c, e.boot)
 
-	for _, n := range []int{0, NonceSize, NonceSize + 8} {
-		svc, _ := NewService(ServiceConfig{Store: e.st, Now: func() time.Time { return e.now }, Rand: &failAfter{n}})
+	for _, n := range []int{0, sha256.Size - 1} {
+		if _, err := NewService(ServiceConfig{Store: e.st, Rand: &failAfter{n}}); err == nil {
+			t.Fatalf("service created with %d bytes of entropy", n)
+		}
+	}
+	for _, n := range []int{sha256.Size, sha256.Size + 8} {
+		svc, err := NewService(ServiceConfig{Store: e.st, Now: func() time.Time { return e.now }, Rand: &failAfter{n}})
+		if err != nil {
+			t.Fatal(err)
+		}
 		e.unchanged("challenge with failing RNG", func() error { _, err := svc.Challenge(bg, "node-1"); return err })
 	}
 	canceled, cancel := context.WithCancel(bg)
@@ -68,7 +77,8 @@ func TestServiceFailuresLeaveNoState(t *testing.T) {
 	})
 	e.unchanged("invalid policy", func() error { _, err := e.svc.ApplyPolicy(bg, "operator:alice", []byte(`{}`)); return err })
 	e.unchanged("nil evidence", func() error { _, err := e.svc.Verify(bg, "node-1", c.ID, c.Nonce, nil); return err })
-	for _, id := range []string{"", "att_", "att_" + string(bytes.Repeat([]byte("A"), 32)), c.ID + "0", " " + c.ID} {
+	for _, id := range []string{"", "att_", "att_" + string(bytes.Repeat([]byte("A"), 48)), c.ID[:36], c.ID + "0",
+		" " + c.ID, strings.ToUpper(c.ID)} {
 		e.unchanged("challenge ID "+id, func() error { _, err := e.svc.Verify(bg, "node-1", id, c.Nonce, ev); return err })
 	}
 	for _, id := range []string{"", "Node-1", "node/1", "node-1\n", string(bytes.Repeat([]byte("a"), 65))} {
