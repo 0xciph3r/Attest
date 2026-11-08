@@ -152,6 +152,15 @@ Availability is not a v1 goal. Required behavior is that every failure is
 the requested identity or secret is not issued. An attacker who can make the
 control plane unavailable can deny service; this is accepted.
 
+Unauthenticated callers must not, however, be able to grow persistent state
+or change a node's standing. Node IDs are not secret, so anyone can request
+enrollment or attestation challenges for any node. Challenges are therefore
+stateless (MAC'd under an in-memory key), and nothing is written, not even
+an audit entry, until the request is shown to come from the node's TPM: a
+recovered activation secret for enrollment, a quote signed by the enrolled
+AK for attestation. Refused unauthenticated attempts are not audited. The
+remaining exposure is CPU, memory and connection exhaustion.
+
 ### Elevation of privilege
 
 | Threat                                                    | Adversary | Mitigation                                                    | Status     |

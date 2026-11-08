@@ -47,7 +47,8 @@ type NodeServiceClient interface {
 	// BeginEnrollment starts credential activation for the node's AK.
 	BeginEnrollment(ctx context.Context, in *BeginEnrollmentRequest, opts ...grpc.CallOption) (*BeginEnrollmentResponse, error)
 	// CompleteEnrollment proves the TPM holding the registered EK and the
-	// AK recovered the activation secret. One attempt per challenge.
+	// AK recovered the activation secret. A challenge is consumed once the
+	// secret matches; wrong secrets are refused without consuming it.
 	CompleteEnrollment(ctx context.Context, in *CompleteEnrollmentRequest, opts ...grpc.CallOption) (*CompleteEnrollmentResponse, error)
 	// GetChallenge issues a fresh, single-use attestation nonce.
 	GetChallenge(ctx context.Context, in *GetChallengeRequest, opts ...grpc.CallOption) (*GetChallengeResponse, error)
@@ -139,7 +140,8 @@ type NodeServiceServer interface {
 	// BeginEnrollment starts credential activation for the node's AK.
 	BeginEnrollment(context.Context, *BeginEnrollmentRequest) (*BeginEnrollmentResponse, error)
 	// CompleteEnrollment proves the TPM holding the registered EK and the
-	// AK recovered the activation secret. One attempt per challenge.
+	// AK recovered the activation secret. A challenge is consumed once the
+	// secret matches; wrong secrets are refused without consuming it.
 	CompleteEnrollment(context.Context, *CompleteEnrollmentRequest) (*CompleteEnrollmentResponse, error)
 	// GetChallenge issues a fresh, single-use attestation nonce.
 	GetChallenge(context.Context, *GetChallengeRequest) (*GetChallengeResponse, error)

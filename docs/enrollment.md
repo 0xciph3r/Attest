@@ -69,25 +69,31 @@ Operator          attestctl/attestd                  attest-agent / TPM
    requires the node to be `registered`, parses the AK and requires its
    attributes to equal the AK template exactly (below), computes the AK name
    itself, and re-verifies the registered EK certificate (roots or validity
-   may have changed). It stores only `SHA-256(secret)`, with a two-minute
-   expiry.
+   may have changed). It writes nothing. The challenge ID is 16 random bytes
+   followed by its expiry (two minutes); the secret is
+   `HMAC-SHA256(k, node ID ‖ challenge ID ‖ AK name)` under a key `k` held
+   only in memory, so a restart invalidates outstanding challenges.
 3. **Activation.** The agent calls `ActivateCredential`. The TPM releases the
    secret only if an object with the given name is loaded in the same TPM as
    the EK. Returning the secret proves AK residency in the approved TPM.
-4. **Completion.** In one transaction the control plane consumes the
-   challenge, re-checks expiry, node, node state, EK certificate and
-   development-root policy, compares the secret hash in constant time, stores
-   the AK and moves the node to `enrolled`, and appends `node.enroll`. If any
-   write fails, nothing is recorded and enrollment fails.
+4. **Completion.** The agent returns the secret with the AK public area. The
+   control plane recomputes the AK name and the expected secret and compares
+   them in constant time, then checks expiry. Only then, in one transaction,
+   it stores the challenge as consumed (refusing one already stored),
+   re-checks node, node state, EK certificate and development-root policy,
+   stores the AK, moves the node to `enrolled` and appends `node.enroll`. If
+   any write fails, nothing is recorded and enrollment fails.
 
-A challenge admits **one attempt**: a wrong secret, wrong node, expired
-challenge or failed re-check consumes it. Every denial at begin or completion
-appends `node.enroll.denied` with a reason code (`node_unknown`,
-`node_state_invalid`, `ak_invalid`, `ek_untrusted`, `ek_development_root`,
-`challenge_unknown`, `challenge_consumed`, `challenge_expired`,
-`challenge_wrong_node`, `activation_failed`, `ak_in_use`) and leaves the node
-state unchanged. Malformed node or challenge IDs are refused before any state
-is read, so attacker-chosen strings do not reach the ledger.
+Begin and complete are unauthenticated until the secret matches, so refusals
+before that point write **nothing**, not even an audit entry: unknown node,
+wrong state at begin, invalid AK, wrong or short secret, a challenge issued to
+another node or AK, a forged or expired challenge, and a challenge already
+consumed. Otherwise anyone could grow the database and ledger without bound.
+A wrong guess does not burn the challenge; guessing a 256-bit MAC is
+infeasible. Once the secret matches, the challenge is consumed whatever the
+outcome, and a denial after that point (`node_state_invalid`, `ek_untrusted`,
+`ek_development_root`, `ak_in_use`) appends `node.enroll.denied` with the
+reason and leaves the node state unchanged.
 
 ### AK template
 

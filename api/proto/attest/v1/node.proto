@@ -23,7 +23,8 @@ service NodeService {
   // BeginEnrollment starts credential activation for the node's AK.
   rpc BeginEnrollment(BeginEnrollmentRequest) returns (BeginEnrollmentResponse);
   // CompleteEnrollment proves the TPM holding the registered EK and the
-  // AK recovered the activation secret. One attempt per challenge.
+  // AK recovered the activation secret. A challenge is consumed once the
+  // secret matches; wrong secrets are refused without consuming it.
   rpc CompleteEnrollment(CompleteEnrollmentRequest) returns (CompleteEnrollmentResponse);
   // GetChallenge issues a fresh, single-use attestation nonce.
   rpc GetChallenge(GetChallengeRequest) returns (GetChallengeResponse);

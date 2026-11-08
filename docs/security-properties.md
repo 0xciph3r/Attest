@@ -39,9 +39,10 @@ key presented at enrollment is proven to reside in that same TPM.
 - Failure behavior: unregistered node, node not in `registered` state, EK
   chain no longer valid, development root not allowed by policy, AK with
   incorrect attributes, failed activation, expired/consumed/other-node
-  challenge, or AK already enrolled elsewhere → enrollment rejected, challenge
-  consumed, denial audited with a reason code; the node does not become
-  `enrolled`.
+  challenge, or AK already enrolled elsewhere → enrollment rejected; the node
+  does not become `enrolled`. Refusals before the secret is proven write
+  nothing; after it, the challenge is consumed and the denial audited with a
+  reason code.
 
 Tests:
 
@@ -53,8 +54,8 @@ Tests:
 | Real AK in a TPM other than the registered one | `TestEnrollmentRequiresApprovedTPM` (swtpm) |
 | Untrusted CA, oversized cert, duplicate EK, invalid node ID | `internal/enrollment` `TestRegisterRejects` |
 | Development root refused without policy, refused after policy withdrawal | `TestEnrollDevelopmentRoot` |
-| Unknown node, non-restricted or malformed AK, already enrolled node | `TestBeginRejects` |
-| Wrong/short secret, expired, wrong node, unknown challenge, revoked, EK cert expired, AK in use; each attempt consumes the challenge | `TestCompleteRejects` |
+| Unknown node, non-restricted or malformed AK, already enrolled node; nothing written | `TestBeginRejects` |
+| Wrong/short secret, expired, wrong node, substituted AK, forged challenge, challenge from before a restart: refused, nothing written, challenge still usable. Revoked, EK cert expired, AK in use: challenge consumed, denial audited | `TestCompleteRejects`, `TestCompleteRejectsMore` |
 | Credential secret never persisted in plaintext | `TestSecretNotStored` |
 | Schema refuses deletion, identity changes and invalid transitions | `internal/store` `TestSchemaGuardsNodes`, `TestNodeLifecycle` |
 
@@ -63,21 +64,31 @@ Tests:
 **Claim.** Each accepted quote was produced after the control plane issued the
 challenge it answers, and each challenge is accepted at most once.
 
-- Mechanism: 256-bit random nonce from `crypto/rand`, stored only as a hash,
-  bound to one enrolled node, expiring after one minute, and consumed in the
-  same transaction that records the verdict and its audit entry. The nonce is
-  the quote's qualifying data (`extraData`) and is compared in constant time.
-- Failure behavior: unknown or consumed challenge → reject and audit (no
-  verdict row, since the challenge has or had one). Expired, other-node or
-  nonce-mismatched answer → challenge consumed, failed verdict recorded and
-  audited. A database trigger refuses re-consumption even by direct SQL.
+- Mechanism: the challenge ID is 128 random bits followed by its expiry (one
+  minute); the nonce is `HMAC-SHA256(k, node ID ‖ challenge ID)` under a key
+  held only in memory. Issuing a challenge writes nothing, and a restart
+  invalidates outstanding challenges. The nonce is the quote's qualifying
+  data (`extraData`) and is compared in constant time. A challenge is stored
+  only when evidence for it authenticates under the node's enrolled AK, in
+  the same transaction that records the verdict and its audit entry; a
+  stored challenge is never accepted again.
+- Failure behavior: anything not shown to come from the node's TPM is refused
+  **without writing anything**: nonce not matching the node and challenge
+  (forged, altered expiry, another node's, or from before a restart),
+  expired challenge, node not enrolled, malformed evidence, bad signature,
+  invalid node key, and replay of a consumed challenge. Otherwise anyone who
+  knows a node ID could grow the ledger or record a failure that supersedes
+  the node's passing attestation and cuts off its workload identities.
+  Authenticated evidence that fails a later check consumes the challenge and
+  records a failed verdict with an audit entry. A database trigger refuses
+  re-consumption even by direct SQL.
 
 Tests (`internal/verifier`): `TestServiceAttest` (replay after success),
-`TestServiceRejects` (expired, answered by another node, wrong nonce echoed,
-quote over another nonce; every failure consumes the challenge),
-`TestServiceConcurrentReplay` (eight concurrent submissions, one accepted),
-`TestServiceUnknownChallengeAuditedOnly`, `TestChainOfTrust/replayed_quote`
-(swtpm); `internal/store` `TestChallengesAreSingleUse`.
+`TestServiceRejects`, `TestServiceForgedChallengesLeaveNoState`,
+`TestServiceChallengeWritesNothing`, `TestServiceConcurrentReplay` (eight
+concurrent submissions, one accepted), `TestChainOfTrust/replayed_quote`
+(swtpm); `internal/api` `TestForeignAttemptsCannotSupersedeNode`;
+`internal/store` `TestChallengesAreSingleUse`.
 
 ## P3 Evidence — implemented
 
