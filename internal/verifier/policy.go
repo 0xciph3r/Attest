@@ -2,6 +2,7 @@ package verifier
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 
@@ -15,6 +16,12 @@ import (
 // closed without recording a verdict.
 func CurrentPolicy(tx *store.Tx) (*policy.Measurement, int64, error) {
 	return parseCurrent(tx.CurrentPolicy(store.PolicyMeasurement))
+}
+
+// StoredPolicy is CurrentPolicy read outside a transaction, without taking
+// the write lock.
+func StoredPolicy(ctx context.Context, st *store.Store) (*policy.Measurement, int64, error) {
+	return parseCurrent(st.CurrentPolicy(ctx, store.PolicyMeasurement))
 }
 
 func parseCurrent(p *store.Policy, err error) (*policy.Measurement, int64, error) {

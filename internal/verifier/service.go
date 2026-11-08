@@ -135,7 +135,7 @@ func (s *Service) Challenge(ctx context.Context, nodeID string) (*Challenge, err
 	if _, err := s.enrolledNode(ctx, nodeID); err != nil {
 		return nil, err
 	}
-	m, _, err := parseCurrent(s.st.CurrentPolicy(ctx, store.PolicyMeasurement))
+	m, _, err := StoredPolicy(ctx, s.st)
 	if err != nil {
 		return nil, err
 	}
