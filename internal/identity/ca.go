@@ -126,7 +126,8 @@ func Init(dir string, o Options) (*CA, error) {
 // expired CA can be rotated, which is how a lapsed CA is recovered.
 //
 // The bundle is replaced before the key: a crash in between leaves the
-// previous CA signing under a bundle that already trusts both.
+// previous CA signing under a bundle that already trusts both, which load
+// accepts and a further Rotate repairs.
 func Rotate(dir string, o Options) (*CA, error) {
 	old, err := load(dir, o, false)
 	if err != nil {
@@ -226,14 +227,18 @@ func load(dir string, o Options, current bool) (*CA, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s: %w", ErrCAInvalid, BundleFile, err)
 	}
-	if len(bundle) == 0 || len(bundle) > MaxBundle || !bundle[0].Equal(cert) {
-		return nil, fmt.Errorf("%w: %s must start with the current CA and hold at most %d", ErrCAInvalid, BundleFile, MaxBundle)
+	at := slices.IndexFunc(bundle, cert.Equal)
+	if at < 0 || len(bundle) > MaxBundle {
+		return nil, fmt.Errorf("%w: %s must hold the current CA and at most %d", ErrCAInvalid, BundleFile, MaxBundle)
 	}
+	// Rotate writes the bundle before the key, so after a crash between
+	// the two the current CA is not first; it is moved there.
+	bundle = append(append([]*x509.Certificate{cert}, bundle[:at]...), bundle[at+1:]...)
 	for i, b := range bundle[1:] {
 		if err := checkCACert(b, o.TrustDomain); err != nil {
 			return nil, err
 		}
-		if b.Equal(bundle[i]) {
+		if slices.ContainsFunc(bundle[:i+1], b.Equal) {
 			return nil, fmt.Errorf("%w: duplicate bundle certificate", ErrCAInvalid)
 		}
 	}

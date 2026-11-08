@@ -411,9 +411,9 @@ func TestLoadRejects(t *testing.T) {
 		{"CA not yet valid", func(e *env) { e.clk.now = e.ca.Cert().NotBefore.Add(-time.Second) }, ErrCAExpired},
 		{"empty bundle", func(e *env) { write(e, BundleFile, nil) }, ErrCAInvalid},
 		{"bundle without the current CA", func(e *env) { write(e, BundleFile, otherCA(e, "attest.local").BundlePEM()) }, ErrCAInvalid},
-		{"current CA not first", func(e *env) {
-			write(e, BundleFile, append(otherCA(e, "attest.local").BundlePEM(), read(e, BundleFile)...))
-		}, ErrCAInvalid},
+		{"foreign CA before the current one", func(e *env) {
+			write(e, BundleFile, append(otherCA(e, "evil.example").BundlePEM(), read(e, BundleFile)...))
+		}, nil},
 		{"three CAs", func(e *env) {
 			b := read(e, BundleFile)
 			b = append(b, otherCA(e, "attest.local").BundlePEM()...)
@@ -493,10 +493,12 @@ func TestRotate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := writeFile(dir, BundleFile, encodeCerts([]*x509.Certificate{c.Cert(), succ.Cert()}), 0o644, true); err != nil {
+	// Rotate writes the successor first.
+	if err := writeFile(dir, BundleFile, encodeCerts([]*x509.Certificate{succ.Cert(), c.Cert()}), 0o644, true); err != nil {
 		t.Fatal(err)
 	}
-	if l, err := Load(dir, opts(clk)); err != nil || !l.Cert().Equal(c.Cert()) {
+	l, err := Load(dir, opts(clk))
+	if err != nil || !l.Cert().Equal(c.Cert()) || len(l.Bundle()) != 2 || !l.Bundle()[0].Equal(c.Cert()) {
 		t.Fatalf("after partial rotation: %v", err)
 	}
 	r, err := Rotate(dir, opts(clk))
