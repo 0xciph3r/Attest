@@ -7,6 +7,7 @@ LDFLAGS   := -s -w -X main.version=$(VERSION)
 LINUX_ARCHES := amd64 arm64
 
 .PHONY: all build test race e2e lint vet fmt-check vuln linux check clean swtpm-up swtpm-down test-tpm \
+	saturation saturation-smoke \
 	generate generate-check proto-lint tools
 
 all: check build
@@ -24,10 +25,20 @@ race:
 e2e:
 	$(GO) test -tags e2e -count=1 -v ./e2e/...
 
+# Load and fault-injection tests. SCALE multiplies the work; the smoke run
+# keeps CI fast and adds the race detector.
+SCALE ?= 10
+saturation:
+	ATTEST_SATURATION_SCALE=$(SCALE) $(GO) test -tags saturation -count=1 -timeout 30m -run Saturation -v ./internal/api/
+
+saturation-smoke:
+	ATTEST_SATURATION_SCALE=1 $(GO) test -race -tags saturation -count=1 -timeout 10m -run Saturation ./internal/api/
+
 vet:
 	$(GO) vet ./...
 	$(GO) vet -tags e2e ./e2e/...
 	$(GO) vet -tags swtpm ./...
+	$(GO) vet -tags saturation ./internal/api/
 
 fmt-check:
 	@out="$$(gofmt -l .)"; if [ -n "$$out" ]; then echo "gofmt needed:"; echo "$$out"; exit 1; fi
