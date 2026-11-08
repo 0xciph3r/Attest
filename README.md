@@ -48,7 +48,7 @@ Requires Go 1.26.6 or later (earlier 1.26 releases have a reachable
 `encoding/asn1` vulnerability, GO-2026-5972).
 
 ```bash
-make build    # bin/attestctl (static, CGO-free)
+make build    # bin/attestctl, bin/attestd (static, CGO-free)
 make check    # gofmt, vet, lint, race tests, e2e tests
 make e2e      # reproduce the audit attack scenarios against real database files
 
@@ -71,6 +71,7 @@ procedure.
 ## Repository layout
 
 ```
+cmd/attestd/          control plane (NodeService over TLS, AdminService over a Unix socket)
 cmd/attestctl/        operator CLI
 internal/audit/       hash chain, checkpoints, verification
 internal/store/       SQLite persistence, migrations and schema invariants

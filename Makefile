@@ -1,7 +1,8 @@
 GO        ?= go
 BIN       := bin
-CMDS      := attestctl
-LDFLAGS   := -s -w
+CMDS      := attestctl attestd
+VERSION   ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+LDFLAGS   := -s -w -X main.version=$(VERSION)
 # Static, CGO-free Linux binaries are the release target.
 LINUX_ARCHES := amd64 arm64
 
