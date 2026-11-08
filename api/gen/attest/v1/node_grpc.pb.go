@@ -42,7 +42,8 @@ const (
 // detail in domain "attest.dev" whose reason is the stable denial code
 // (for example "pcr_digest_mismatch"). Malformed requests are
 // INVALID_ARGUMENT; requests without a valid client certificate where one
-// is required are UNAUTHENTICATED.
+// is required are UNAUTHENTICATED. Calls over the server's rate limits fail
+// with RESOURCE_EXHAUSTED before the request is read; retry with backoff.
 type NodeServiceClient interface {
 	// BeginEnrollment starts credential activation for the node's AK.
 	BeginEnrollment(ctx context.Context, in *BeginEnrollmentRequest, opts ...grpc.CallOption) (*BeginEnrollmentResponse, error)
@@ -135,7 +136,8 @@ func (c *nodeServiceClient) IssueWorkloadIdentity(ctx context.Context, in *Issue
 // detail in domain "attest.dev" whose reason is the stable denial code
 // (for example "pcr_digest_mismatch"). Malformed requests are
 // INVALID_ARGUMENT; requests without a valid client certificate where one
-// is required are UNAUTHENTICATED.
+// is required are UNAUTHENTICATED. Calls over the server's rate limits fail
+// with RESOURCE_EXHAUSTED before the request is read; retry with backoff.
 type NodeServiceServer interface {
 	// BeginEnrollment starts credential activation for the node's AK.
 	BeginEnrollment(context.Context, *BeginEnrollmentRequest) (*BeginEnrollmentResponse, error)

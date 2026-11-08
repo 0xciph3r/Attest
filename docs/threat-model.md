@@ -159,7 +159,14 @@ stateless (MAC'd under an in-memory key), and nothing is written, not even
 an audit entry, until the request is shown to come from the node's TPM: a
 recovered activation secret for enrollment, a quote signed by the enrolled
 AK for attestation. Refused unauthenticated attempts are not audited. The
-remaining exposure is CPU, memory and connection exhaustion.
+remaining exposure is CPU, memory and connection exhaustion. The node
+listener admits each call before reading its request, against a token bucket
+per source address (IPv4, or IPv6 /64) and a global one; the per-address
+table is bounded, and rotating addresses shares one overflow bucket rather
+than resetting limits. Connections are capped at 1024 and idle ones closed.
+Refusals are logged at most once per ten seconds. An attacker with enough
+addresses can still exhaust the global budget and deny service to nodes;
+this is within the accepted availability risk.
 
 ### Elevation of privilege
 
