@@ -37,6 +37,10 @@ func ValidNodeID(id string) bool { return nodeIDRe.MatchString(id) }
 // ValidWorkloadName reports whether name is a well-formed workload name.
 func ValidWorkloadName(name string) bool { return workloadNameRe.MatchString(name) }
 
+// ValidSystemdService reports whether unit is a well-formed systemd
+// .service unit name.
+func ValidSystemdService(unit string) bool { return systemdServiceRe.MatchString(unit) }
+
 // Workload authorizes one workload: which nodes it may be identified on and
 // the local operating-system boundary that identifies it there. A caller
 // matches only if both the systemd service and the UID match.
@@ -105,7 +109,7 @@ func (p *WorkloadPolicy) validate() error {
 		if len(w.Nodes) == 0 {
 			return fmt.Errorf("%w: workload %q lists no nodes", ErrInvalid, w.Name)
 		}
-		if !systemdServiceRe.MatchString(w.SystemdUnit) {
+		if !ValidSystemdService(w.SystemdUnit) {
 			return fmt.Errorf("%w: workload %q: systemd_unit must name a .service unit", ErrInvalid, w.Name)
 		}
 		switch {
