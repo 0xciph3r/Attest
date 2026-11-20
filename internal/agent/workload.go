@@ -205,13 +205,17 @@ func passThrough(log *slog.Logger, c *Caller, err error) error {
 }
 
 // checkWorkloadIdentity accepts id only if it is a workload identity that
-// chains to the bundle it carries and certifies the key in csr.
+// chains to the bundle it carries, that bundle continues the agent's, and
+// it certifies the key in csr.
 func (a *Agent) checkWorkloadIdentity(id *attestv1.X509Identity, csr *x509.CertificateRequest) (*attestv1.X509Identity, error) {
 	if id == nil {
 		return nil, errors.New("no identity")
 	}
 	leaf, bundle, err := parseIdentity(id)
 	if err != nil {
+		return nil, err
+	}
+	if err := a.continuous(bundle); err != nil {
 		return nil, err
 	}
 	got, err := identity.Verify(bundle, a.cfg.TrustDomain, leaf, a.cfg.Now(), x509.ExtKeyUsageClientAuth)

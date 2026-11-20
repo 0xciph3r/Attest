@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"net"
+	"slices"
 	"sync"
 	"time"
 
@@ -191,15 +192,19 @@ func (a *Agent) Attest(ctx context.Context) error {
 }
 
 // checkNodeIdentity accepts id only if it names this node, chains to the
-// bundle it carries and certifies the TPM node key. Adopting that bundle is
-// safe because it arrived over a connection authenticated by the previous
-// one.
+// bundle it carries and certifies the TPM node key. The bundle must also
+// share a CA with the one the agent trusts now, so the control plane can
+// rotate its CA, which keeps the previous one in the bundle, but cannot
+// replace the agent's root of trust with an unrelated one.
 func (a *Agent) checkNodeIdentity(id *attestv1.X509Identity) (*x509.Certificate, []*x509.Certificate, error) {
 	if id == nil {
 		return nil, nil, errors.New("agent: attestation returned no node identity")
 	}
 	leaf, bundle, err := parseIdentity(id)
 	if err != nil {
+		return nil, nil, err
+	}
+	if err := a.continuous(bundle); err != nil {
 		return nil, nil, err
 	}
 	want, err := identity.NodeID(a.cfg.TrustDomain, a.cfg.NodeID)
@@ -217,6 +222,24 @@ func (a *Agent) checkNodeIdentity(id *attestv1.X509Identity) (*x509.Certificate,
 		return nil, nil, errors.New("agent: node identity does not certify the TPM node key")
 	}
 	return leaf, bundle, nil
+}
+
+// ErrBundleDiscontinuous means the control plane returned a trust bundle
+// sharing no CA with the one the agent trusts. The agent then needs a new
+// bootstrap bundle, as it does after two CA rotations within the lifetime
+// of its node identity.
+var ErrBundleDiscontinuous = errors.New("agent: trust bundle shares no CA with the current one")
+
+func (a *Agent) continuous(bundle []*x509.Certificate) error {
+	a.mu.Lock()
+	cur := a.bundle
+	a.mu.Unlock()
+	for _, c := range bundle {
+		if slices.ContainsFunc(cur, c.Equal) {
+			return nil
+		}
+	}
+	return ErrBundleDiscontinuous
 }
 
 func parseIdentity(id *attestv1.X509Identity) (*x509.Certificate, []*x509.Certificate, error) {
