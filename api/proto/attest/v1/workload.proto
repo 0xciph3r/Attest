@@ -1,0 +1,36 @@
+syntax = "proto3";
+
+package attest.v1;
+
+import "attest/v1/node.proto";
+
+option go_package = "github.com/0xciph3r/attest/api/gen/attest/v1;attestv1";
+
+// WorkloadService is the node agent's local API, served on a Unix socket.
+//
+// The agent identifies the caller from the kernel when it connects: the
+// systemd system service whose cgroup contains the connecting process, and
+// the process's effective UID. Nothing in a request names the workload. A
+// connection from a process outside a system service, or one that exits
+// before it is identified, is refused during the handshake.
+//
+// Denials are PERMISSION_DENIED with a google.rpc.ErrorInfo detail in
+// domain "attest.dev" carrying the stable denial code (for example
+// "workload_not_allowed"). UNAVAILABLE means the agent holds no current
+// node identity, for example while the node is not attested; retry with
+// backoff.
+service WorkloadService {
+  // FetchX509Identity issues an X.509-SVID for the calling workload's key.
+  // The workload generates the key and keeps it; only the CSR leaves it.
+  rpc FetchX509Identity(FetchX509IdentityRequest) returns (FetchX509IdentityResponse);
+}
+
+message FetchX509IdentityRequest {
+  // PKCS#10 request, DER, signed by the workload's ECDSA P-256 key. Only
+  // the key and the proof of possession are used.
+  bytes csr = 1;
+}
+
+message FetchX509IdentityResponse {
+  X509Identity identity = 1;
+}
