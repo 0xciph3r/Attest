@@ -71,7 +71,7 @@ func serviceUnit(path string) (string, error) {
 		switch {
 		case p == "" || p == "." || p == "..":
 			return "", fmt.Errorf("%w: cgroup %q", ErrNotService, path)
-		case strings.HasSuffix(p, ".slice"):
+		case validSlice(p):
 			continue
 		case policy.ValidSystemdService(p):
 			return p, nil
@@ -80,6 +80,13 @@ func serviceUnit(path string) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("%w: cgroup %q", ErrNotService, path)
+}
+
+// validSlice reports whether p is a slice unit name: the syntax of a
+// service name, but never a template instance.
+func validSlice(p string) bool {
+	name, ok := strings.CutSuffix(p, ".slice")
+	return ok && !strings.Contains(name, "@") && policy.ValidSystemdService(name+".service")
 }
 
 // identify returns the system service and UID of the process at the other
