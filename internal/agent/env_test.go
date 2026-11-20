@@ -118,7 +118,7 @@ func (f *fakeTPM) quoteTimes() []time.Time {
 
 // env is an in-process attestd with node n1 enrolled.
 type env struct {
-	t     *testing.T
+	t     testing.TB
 	clk   *clock
 	st    *store.Store
 	ca    *identity.CA
@@ -130,7 +130,7 @@ type env struct {
 	logs  *syncBuffer
 }
 
-func newEnv(t *testing.T) *env {
+func newEnv(t testing.TB) *env {
 	t.Helper()
 	clk := &clock{now: time.Now().UTC().Truncate(time.Second)}
 	st, err := store.Open(bg, filepath.Join(t.TempDir(), "attest.db"))
