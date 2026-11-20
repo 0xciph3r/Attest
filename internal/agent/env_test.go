@@ -13,10 +13,15 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 
 	attestv1 "github.com/0xciph3r/attest/api/gen/attest/v1"
@@ -218,6 +223,32 @@ func (e *env) attested(mods ...func(*Config)) *Agent {
 	return a
 }
 
+// as identifies every connection as c.
+func as(c Caller) identifyFunc {
+	return func(*net.UnixConn) (*Caller, error) { return &c, nil }
+}
+
+var apiCaller = Caller{PID: 4242, UID: 1000, Unit: "api.service", Cgroup: "/system.slice/api.service"}
+
+// serve runs a's Workload API on a fresh Unix socket and returns a client.
+func serve(t *testing.T, a *Agent, id identifyFunc) attestv1.WorkloadServiceClient {
+	t.Helper()
+	path := filepath.Join(shortDir(t), "w.sock")
+	l, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := a.newWorkloadServer(id)
+	go func() { _ = srv.Serve(LimitListener(l, 8)) }()
+	t.Cleanup(srv.Stop)
+	cc, err := grpc.NewClient("unix://"+path, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cc.Close() })
+	return attestv1.NewWorkloadServiceClient(cc)
+}
+
 // shortDir returns a temporary directory short enough for Unix socket
 // paths, which t.TempDir can exceed on macOS.
 func shortDir(t *testing.T) string {
@@ -237,4 +268,43 @@ func p256(t testing.TB) *ecdsa.PrivateKey {
 		t.Fatal(err)
 	}
 	return k
+}
+
+func csrFor(t testing.TB, key crypto.Signer) []byte {
+	t.Helper()
+	der, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{}, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return der
+}
+
+func fetch(c attestv1.WorkloadServiceClient, csr []byte) (*attestv1.X509Identity, error) {
+	ctx, cancel := context.WithTimeout(bg, 10*time.Second)
+	defer cancel()
+	resp, err := c.FetchX509Identity(ctx, &attestv1.FetchX509IdentityRequest{Csr: csr})
+	return resp.GetIdentity(), err
+}
+
+func wantCode(t *testing.T, err error, code codes.Code) {
+	t.Helper()
+	if status.Code(err) != code {
+		t.Fatalf("err = %v, want %v", err, code)
+	}
+}
+
+// audited counts audit entries for action whose object starts with
+// "identity/" and that concern workloads, i.e. requests that reached attestd.
+func (e *env) audited(action string) int {
+	e.t.Helper()
+	n := 0
+	for ent, err := range e.st.AuditEntries(bg) {
+		if err != nil {
+			e.t.Fatal(err)
+		}
+		if ent.Action == action && strings.Contains(string(ent.Metadata), "workload") {
+			n++
+		}
+	}
+	return n
 }
