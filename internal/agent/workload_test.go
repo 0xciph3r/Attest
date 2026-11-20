@@ -260,15 +260,20 @@ func TestCheckWorkloadIdentityRejects(t *testing.T) {
 		t.Fatalf("valid workload identity refused: %v", err)
 	}
 	for name, id := range map[string]*attestv1.X509Identity{
-		"missing":   nil,
-		"node cert": {Certificate: issue(t, e.ca, n1, key.Public()), Bundle: bundle},
-		"other key": {Certificate: issue(t, e.ca, wl, p256(t).Public()), Bundle: bundle},
-		"other ca":  {Certificate: issue(t, other, wl, key.Public()), Bundle: bundle},
-		"no bundle": {Certificate: issue(t, e.ca, wl, key.Public())},
+		"missing":      nil,
+		"node cert":    {Certificate: issue(t, e.ca, n1, key.Public()), Bundle: bundle},
+		"other key":    {Certificate: issue(t, e.ca, wl, p256(t).Public()), Bundle: bundle},
+		"other ca":     {Certificate: issue(t, other, wl, key.Public()), Bundle: bundle},
+		"no bundle":    {Certificate: issue(t, e.ca, wl, key.Public())},
+		"foreign root": {Certificate: issue(t, other, wl, key.Public()), Bundle: raw(other.Bundle())},
 	} {
 		if _, err := a.checkWorkloadIdentity(id, csr); err == nil {
 			t.Errorf("%s: accepted", name)
 		}
+	}
+	rotated := append(raw(other.Bundle()), bundle...)
+	if _, err := a.checkWorkloadIdentity(&attestv1.X509Identity{Certificate: issue(t, other, wl, key.Public()), Bundle: rotated}, csr); err != nil {
+		t.Errorf("identity from a rotated CA refused: %v", err)
 	}
 }
 

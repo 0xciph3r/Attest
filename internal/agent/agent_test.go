@@ -97,7 +97,7 @@ func TestAttestRefusals(t *testing.T) {
 }
 
 // issue signs a certificate for id and key with ca.
-func issue(t *testing.T, ca *identity.CA, id identity.ID, key any) []byte {
+func issue(t testing.TB, ca *identity.CA, id identity.ID, key any) []byte {
 	t.Helper()
 	iss, err := ca.Issue(identity.IssueRequest{ID: id, PublicKey: key, TTL: time.Hour})
 	if err != nil {
@@ -141,10 +141,16 @@ func TestCheckNodeIdentityRejects(t *testing.T) {
 		"other key":     {Certificate: issue(t, e.ca, n1, p256(t).Public()), Bundle: bundle},
 		"other ca":      {Certificate: issue(t, other, n1, tpmKey), Bundle: bundle},
 		"wrong bundle":  {Certificate: good, Bundle: raw(other.Bundle())},
+		"foreign root":  {Certificate: issue(t, other, n1, tpmKey), Bundle: raw(other.Bundle())},
 	} {
 		if _, _, err := a.checkNodeIdentity(id); err == nil {
 			t.Errorf("%s: accepted", name)
 		}
+	}
+	// A rotated CA arrives in a bundle that still holds the current one.
+	rotated := append(raw(other.Bundle()), bundle...)
+	if _, _, err := a.checkNodeIdentity(&attestv1.X509Identity{Certificate: issue(t, other, n1, tpmKey), Bundle: rotated}); err != nil {
+		t.Errorf("identity from a rotated CA refused: %v", err)
 	}
 	e.clk.Add(2 * time.Hour)
 	if _, _, err := a.checkNodeIdentity(&attestv1.X509Identity{Certificate: good, Bundle: bundle}); err == nil {
