@@ -236,3 +236,38 @@ func TestCertifyNodeKey(t *testing.T) {
 		t.Fatal("certified a flushed key")
 	}
 }
+
+// The TPM-resident node key signs TLS handshakes and certificate requests
+// through crypto.Signer, and only that key's signatures are released.
+func TestNodeKeySigner(t *testing.T) {
+	dev := swtpmtest.Open(t)
+	key := loadNodeKey(t, dev, bytes.Repeat([]byte{3}, tpm.NodeKeyUniqueSize))
+	s, err := tpm.NewSigner(tpm.Locked(dev), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub := s.Public().(*ecdsa.PublicKey)
+	digest := sha256.Sum256([]byte("handshake"))
+	sig, err := s.Sign(rand.Reader, digest[:], crypto.SHA256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ecdsa.VerifyASN1(pub, digest[:], sig) {
+		t.Fatal("TPM signature does not verify")
+	}
+	csr, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{}, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := x509.ParseCertificateRequest(csr)
+	if err != nil || req.CheckSignature() != nil {
+		t.Fatalf("CSR signed by the TPM key: %v", err)
+	}
+	if _, err := s.Sign(rand.Reader, make([]byte, 48), crypto.SHA384); err == nil {
+		t.Fatal("SHA-384 digest signed")
+	}
+	ak := loadAK(t, dev)
+	if _, err := tpm.NewSigner(dev, ak); err == nil {
+		t.Fatal("signer built over the restricted AK")
+	}
+}
