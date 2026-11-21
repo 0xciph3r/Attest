@@ -16,6 +16,7 @@ import (
 
 	"github.com/0xciph3r/attest/internal/api"
 	"github.com/0xciph3r/attest/internal/identity"
+	"github.com/0xciph3r/attest/internal/secfile"
 	"github.com/0xciph3r/attest/internal/strictjson"
 	"github.com/0xciph3r/attest/internal/verifier"
 )
@@ -72,29 +73,11 @@ func (c *Config) DBPath() string { return filepath.Join(c.StateDir, "attest.db")
 func (c *Config) CADir() string { return filepath.Join(c.StateDir, "ca") }
 
 // LoadConfig reads and validates the configuration at path. The file must
-// not be writable by group or others.
+// be owned by root or attestd's user and not writable by group or others.
 func LoadConfig(path string) (*Config, error) {
-	f, err := os.Open(path)
+	b, err := secfile.Read(path, maxConfigSize)
 	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = f.Close() }()
-	fi, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
-	if !fi.Mode().IsRegular() {
-		return nil, fmt.Errorf("config: %s is not a regular file", path)
-	}
-	if fi.Mode().Perm()&0o022 != 0 {
-		return nil, fmt.Errorf("config: %s is writable by group or others", path)
-	}
-	b, err := io.ReadAll(io.LimitReader(f, maxConfigSize+1))
-	if err != nil {
-		return nil, err
-	}
-	if len(b) > maxConfigSize {
-		return nil, fmt.Errorf("config: %s exceeds %d bytes", path, maxConfigSize)
+		return nil, fmt.Errorf("config: %w", err)
 	}
 	var c Config
 	if err := strictjson.Decode(b, &c); err != nil {
