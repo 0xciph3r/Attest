@@ -692,3 +692,54 @@ func TestVerifyRejects(t *testing.T) {
 		})
 	}
 }
+
+func TestParseBundle(t *testing.T) {
+	c, dir, clk := newCAInDir(t)
+	got, err := ParseBundle(c.BundlePEM(), "attest.local")
+	if err != nil || len(got) != 1 || !got[0].Equal(c.Cert()) {
+		t.Fatalf("ParseBundle(current) = %v, %v", got, err)
+	}
+	r, err := Rotate(dir, opts(clk))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := ParseBundle(r.BundlePEM(), "attest.local"); err != nil || len(got) != 2 {
+		t.Fatalf("ParseBundle(rotated) = %v, %v", got, err)
+	}
+
+	certPEM := func(c *x509.Certificate) []byte {
+		return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: c.Raw})
+	}
+	cat := func(bs ...[]byte) []byte { return bytes.Join(bs, nil) }
+	r2, err := Rotate(dir, opts(clk))
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := Init(t.TempDir(), Options{TrustDomain: "other.test", Now: clk.Now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyDER, err := x509.MarshalPKCS8PrivateKey(p256(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf := issue(t, c, must(WorkloadID("attest.local", "api")), time.Hour).Cert
+	for name, b := range map[string][]byte{
+		"empty":         nil,
+		"whitespace":    []byte("\n \n"),
+		"not PEM":       []byte("not a bundle"),
+		"trailing data": cat(c.BundlePEM(), []byte("junk")),
+		"private key":   cat(c.BundlePEM(), pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})),
+		"headers":       pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Headers: map[string]string{"a": "b"}, Bytes: c.Cert().Raw}),
+		"bad DER":       pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: []byte("x")}),
+		"three CAs":     cat(r2.BundlePEM(), c.BundlePEM()),
+		"duplicate":     cat(c.BundlePEM(), c.BundlePEM()),
+		"other domain":  other.BundlePEM(),
+		"mixed domains": cat(c.BundlePEM(), other.BundlePEM()),
+		"leaf":          certPEM(leaf),
+	} {
+		if _, err := ParseBundle(b, "attest.local"); !errors.Is(err, ErrCAInvalid) {
+			t.Errorf("%s: err = %v, want ErrCAInvalid", name, err)
+		}
+	}
+}

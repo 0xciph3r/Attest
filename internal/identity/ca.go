@@ -245,6 +245,28 @@ func load(dir string, o Options, current bool) (*CA, error) {
 	return &CA{opts: o, cert: cert, signer: key, bundle: bundle}, nil
 }
 
+// ParseBundle parses a PEM trust bundle as distributed to nodes: one CA
+// for td, or two during a rotation, and nothing else. It does not check
+// validity periods; Verify does, at each use.
+func ParseBundle(b []byte, td string) ([]*x509.Certificate, error) {
+	certs, _, err := decodePEM(b, false)
+	if err != nil {
+		return nil, fmt.Errorf("%w: bundle: %w", ErrCAInvalid, err)
+	}
+	if len(certs) == 0 || len(certs) > MaxBundle {
+		return nil, fmt.Errorf("%w: bundle must hold 1 to %d CAs, not %d", ErrCAInvalid, MaxBundle, len(certs))
+	}
+	for i, c := range certs {
+		if err := checkCACert(c, td); err != nil {
+			return nil, err
+		}
+		if slices.ContainsFunc(certs[:i], c.Equal) {
+			return nil, fmt.Errorf("%w: duplicate bundle certificate", ErrCAInvalid)
+		}
+	}
+	return certs, nil
+}
+
 // checkCACert requires a self-signed ECDSA P-256 CA for exactly the trust
 // domain that cannot issue intermediates.
 func checkCACert(c *x509.Certificate, td string) error {
